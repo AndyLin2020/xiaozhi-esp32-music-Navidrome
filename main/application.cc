@@ -783,6 +783,14 @@ void Application::SetAecMode(AecMode mode) {
 void Application::AddAudioData(AudioStreamPacket&& packet) {
     auto codec = Board::GetInstance().GetAudioCodec();
     if (device_state_ == kDeviceStateIdle && codec->output_enabled()) {
+	    // 打印接收到的数据信息
+        //ESP_LOGI(TAG, "AddAudioData: Received packet - sample_rate=%d, channels=%d, payload_size=%zu",
+        //         packet.sample_rate, packet.channels, packet.payload.size());
+				 
+		// 打印前 16 个字节的PCM数据
+        //if (packet.payload.size() >= 16) {
+        //    ESP_LOG_BUFFER_HEXDUMP(TAG, packet.payload.data(), 16, ESP_LOG_INFO);
+        // }
         // packet.payload包含的是原始PCM数据（int16_t）
         if (packet.payload.size() >= 2) {
             size_t num_samples = packet.payload.size() / sizeof(int16_t);
