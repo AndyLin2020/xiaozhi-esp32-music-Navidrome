@@ -728,7 +728,6 @@ void Esp32Music::PlayAudioStream() {
         }
     }
     
-    ESP_LOGI(TAG, "148514");
     ESP_LOGI(TAG, "Starting playback with buffer size: %zu", buffer_size_);
     
     size_t total_played = 0;
@@ -1073,7 +1072,6 @@ bool Esp32Music::DownloadLyrics(const std::string& lyric_url) {
         add_auth_headers(http.get());
         
         // 打开GET连接
-        ESP_LOGI(TAG, "148514");
         if (!http->Open("GET", current_url)) {
             ESP_LOGE(TAG, "Failed to open HTTP connection for lyrics");
             // 移除delete http; 因为unique_ptr会自动管理内存
