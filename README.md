@@ -1,4 +1,4 @@
-# 小智开源音乐固件
+﻿# 小智开源音乐固件
 
 （中文 | [English](README_en.md) | [日本語](README_ja.md)）
 
@@ -19,6 +19,8 @@
 项目主要贡献者：空白泡泡糖果（B站UP），硅灵造物科技（B站UP）
 
 音乐服务器提供者（为爱发电）：蔓延科技
+
+转自Maggotxy修改的项目：https://github.com/Maggotxy/xiaozhi-esp32-music
 
 ### 💡注意事项
 
