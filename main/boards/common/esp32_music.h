@@ -8,8 +8,12 @@
 #include <mutex>
 #include <condition_variable>
 #include <vector>
+#include <memory>
 
 #include "music.h"
+
+// forward declare Http (实现由 Board::GetInstance().GetNetwork() 提供)
+class Http;
 
 // MP3解码器支持
 extern "C" {
@@ -53,7 +57,7 @@ private:
     std::condition_variable buffer_cv_;
     size_t buffer_size_;
     static constexpr size_t MAX_BUFFER_SIZE = 256 * 1024;  // 256KB缓冲区（降低以减少brownout风险）
-    static constexpr size_t MIN_BUFFER_SIZE = 32 * 1024;   // 32KB最小播放缓冲（降低以减少brownout风险）
+    static constexpr size_t MIN_BUFFER_SIZE = 32 * 1024;   // 32KB最小播放缓冲（降低以减少brownout风险）]
     
     // MP3解码器相关
     HMP3Decoder mp3_decoder_;
@@ -76,6 +80,11 @@ private:
     
     // ID3标签处理
     size_t SkipId3Tag(uint8_t* data, size_t size);
+
+    // 新增: 管理歌词下载时的 HTTP 客户端指针与互斥
+    std::mutex lyric_http_mutex_;
+    std::unique_ptr<Http> current_lyric_http_;
+    void AbortCurrentLyricHttp(); // 关闭并释放当前 lyric http
 
 public:
     Esp32Music();

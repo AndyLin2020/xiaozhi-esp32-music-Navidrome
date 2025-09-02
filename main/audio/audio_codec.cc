@@ -95,7 +95,7 @@ bool AudioCodec::SetOutputSampleRate(int sample_rate) {
     }
     
     if (output_sample_rate_ == sample_rate) {
-        ESP_LOGI(TAG, "Sample rate already set to %d Hz", sample_rate);
+        // ESP_LOGD(TAG, "Sample rate already set to %d Hz", sample_rate); // 可以降级为Debug日志
         return true;
     }
     
@@ -107,17 +107,15 @@ bool AudioCodec::SetOutputSampleRate(int sample_rate) {
     
     ESP_LOGI(TAG, "Changing output sample rate from %d to %d Hz", output_sample_rate_, sample_rate);
     
-    // 先尝试禁用 I2S 通道（如果已启用的话）
+    // 【优化点】: 记录通道之前的状态
     bool was_enabled = false;
     esp_err_t disable_ret = i2s_channel_disable(tx_handle_);
     if (disable_ret == ESP_OK) {
         was_enabled = true;
         ESP_LOGI(TAG, "Disabled I2S TX channel for reconfiguration");
-    } else if (disable_ret == ESP_ERR_INVALID_STATE) {
-        // 通道可能已经是禁用状态，这是正常的
-        ESP_LOGI(TAG, "I2S TX channel was already disabled");
-    } else {
-        ESP_LOGW(TAG, "Failed to disable I2S TX channel: %s", esp_err_to_name(disable_ret));
+    } else if (disable_ret != ESP_ERR_INVALID_STATE) {
+        // 如果禁用失败且不是因为“已经禁用”，则记录警告
+        ESP_LOGW(TAG, "Failed to disable I2S TX channel before reconfig: %s", esp_err_to_name(disable_ret));
     }
     
     // 重新配置 I2S 时钟
@@ -132,12 +130,14 @@ bool AudioCodec::SetOutputSampleRate(int sample_rate) {
     
     esp_err_t ret = i2s_channel_reconfig_std_clock(tx_handle_, &clk_cfg);
     
-    // 重新启用通道（无论之前是什么状态，现在都需要启用以便播放音频）
-    esp_err_t enable_ret = i2s_channel_enable(tx_handle_);
-    if (enable_ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to enable I2S TX channel: %s", esp_err_to_name(enable_ret));
-    } else {
-        ESP_LOGI(TAG, "Enabled I2S TX channel");
+    // 【优化点】: 只有当通道之前是启用时，才重新启用它
+    if (was_enabled) {
+        esp_err_t enable_ret = i2s_channel_enable(tx_handle_);
+        if (enable_ret != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to re-enable I2S TX channel: %s", esp_err_to_name(enable_ret));
+        } else {
+            ESP_LOGI(TAG, "Re-enabled I2S TX channel");
+        }
     }
     
     if (ret == ESP_OK) {
@@ -146,6 +146,10 @@ bool AudioCodec::SetOutputSampleRate(int sample_rate) {
         return true;
     } else {
         ESP_LOGE(TAG, "Failed to change sample rate to %d Hz: %s", sample_rate, esp_err_to_name(ret));
+        // 如果配置失败，尝试恢复通道到之前的状态
+        if (was_enabled) {
+            i2s_channel_enable(tx_handle_);
+        }
         return false;
     }
 }
