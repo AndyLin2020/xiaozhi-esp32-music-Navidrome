@@ -62,7 +62,7 @@ static void add_auth_headers(Http* http) {
         http->SetHeader("X-Chip-ID", chip_id);
         http->SetHeader("X-Timestamp", std::to_string(timestamp));
         http->SetHeader("X-Dynamic-Key", dynamic_key);
-        ESP_LOGI(TAG, "Added auth headers - MAC: %s, ChipID: %s, Timestamp: %lld", mac.c_str(), chip_id.c_str(), timestamp);
+        //ESP_LOGI(TAG, "Added auth headers - MAC: %s, ChipID: %s, Timestamp: %lld", mac.c_str(), chip_id.c_str(), timestamp);
     }
 }
 
@@ -515,7 +515,7 @@ void Esp32Music::DownloadAudioStream(const std::string& music_url) {
         
         if (bytes_read <= 0) {
             if (bytes_read < 0) ESP_LOGE(TAG, "Failed to read audio data: error code %d", bytes_read);
-            else ESP_LOGI(TAG, "Audio stream download completed, total: %zu bytes", total_downloaded);
+            else ESP_LOGI(TAG, "Audio stream download completed, total: %u bytes", total_downloaded);
             break;
         }
 
@@ -605,7 +605,7 @@ void Esp32Music::PlayAudioStream() {
         }
     }
     
-    ESP_LOGI(TAG, "Starting playback with buffer size: %zu", buffer_size_);
+    ESP_LOGI(TAG, "Starting playback with buffer size: %d", buffer_size_);
     
     size_t total_played = 0;
     const size_t MP3_INPUT_BUFFER_SIZE = 8192;
