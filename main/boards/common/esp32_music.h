@@ -30,6 +30,29 @@ struct AudioChunk {
 };
 
 class Esp32Music : public Music {
+public:
+    Esp32Music();
+    ~Esp32Music();
+
+    virtual bool Download(const std::string& song_name) override;
+    virtual bool Play() override;
+    virtual bool Stop() override;
+    virtual std::string GetDownloadResult() override;
+    
+    // 新增：流式控制
+    virtual bool StartStreaming(const std::string& music_url) override;
+    virtual bool StopStreaming() override;  // 停止流式播放
+    virtual size_t GetBufferSize() const override { return buffer_size_; }
+    virtual bool IsDownloading() const override { return is_downloading_; }
+
+    // 播放列表 / 切歌 接口
+    bool Next();                       // 播放下一首（若playlist模式）
+    bool Prev();                       // 播放上一首（若playlist模式）
+    bool PlayTrackAt(int index);       // 播放播放列表中的指定索引
+    size_t GetPlaylistSize() const;    // 返回 playlist_ 的大小（线程安全）
+    void ClearPlaylist();
+    bool SetPlaylistFromJson(const std::string& json); // 从返回的 JSON 构建 playlist
+
 private:
     std::string last_downloaded_data_;
     std::string current_music_url_;
@@ -57,7 +80,7 @@ private:
     std::condition_variable buffer_cv_;
     size_t buffer_size_;
     static constexpr size_t MAX_BUFFER_SIZE = 256 * 1024;  // 256KB缓冲区（降低以减少brownout风险）
-    static constexpr size_t MIN_BUFFER_SIZE = 32 * 1024;   // 32KB最小播放缓冲（降低以减少brownout风险）]
+    static constexpr size_t MIN_BUFFER_SIZE = 32 * 1024;   // 32KB最小播放缓冲（降低以减少brownout风险）
     
     // MP3解码器相关
     HMP3Decoder mp3_decoder_;
@@ -86,20 +109,31 @@ private:
     std::unique_ptr<Http> current_lyric_http_;
     void AbortCurrentLyricHttp(); // 关闭并释放当前 lyric http
 
+    // ========== Playlist 支持 ==========
 public:
-    Esp32Music();
-    ~Esp32Music();
+    struct PlaylistTrack {
+        std::string id;
+        std::string title;
+        std::string artist;
+        std::string album;
+        std::string audio_url;
+        std::string lyric_url;
+    };
 
-    virtual bool Download(const std::string& song_name) override;
-    virtual bool Play() override;
-    virtual bool Stop() override;
-    virtual std::string GetDownloadResult() override;
-    
-    // 新增方法
-    virtual bool StartStreaming(const std::string& music_url) override;
-    virtual bool StopStreaming() override;  // 停止流式播放
-    virtual size_t GetBufferSize() const override { return buffer_size_; }
-    virtual bool IsDownloading() const override { return is_downloading_; }
+private:
+    mutable std::mutex playlist_mutex_; // mutable so const methods can lock
+    std::vector<PlaylistTrack> playlist_;
+    int current_playlist_index_;    // 当前在 playlist 中的索引
+    bool is_playlist_mode_;         // 是否在播放 playlist
+    bool playlist_random_;          // 是否随机播放
+    std::string playlist_type_;     // 如 "artist_temp" / "album" 等
+
+    // playlist 操作的内部实现
+    bool PlayNextInPlaylist();      // 移动并播放下一首（返回是否成功）
+    bool PlayPrevInPlaylist();      // 播放上一首
+    bool PlayTrackInternal(int index); // 内部切歌（线程安全）
+    void OnPlaybackFinished();      // 播放完后回调（检查 playlist 并自动切歌）
+
 };
 
 #endif // ESP32_MUSIC_H

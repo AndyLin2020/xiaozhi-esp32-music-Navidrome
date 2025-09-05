@@ -17,6 +17,7 @@
 #include <sstream>
 #include <algorithm>
 #include <cctype>
+#include <random>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 
@@ -62,7 +63,6 @@ static void add_auth_headers(Http* http) {
         http->SetHeader("X-Chip-ID", chip_id);
         http->SetHeader("X-Timestamp", std::to_string(timestamp));
         http->SetHeader("X-Dynamic-Key", dynamic_key);
-        //ESP_LOGI(TAG, "Added auth headers - MAC: %s, ChipID: %s, Timestamp: %lld", mac.c_str(), chip_id.c_str(), timestamp);
     }
 }
 
@@ -121,7 +121,9 @@ Esp32Music::Esp32Music() : last_downloaded_data_(), current_music_url_(), curren
                          is_playing_(false), is_downloading_(false), 
                          play_thread_(), download_thread_(), audio_buffer_(), buffer_mutex_(), 
                          buffer_cv_(), buffer_size_(0), mp3_decoder_(nullptr), mp3_frame_info_(), 
-                         mp3_decoder_initialized_(false) {
+                         mp3_decoder_initialized_(false),
+                         playlist_mutex_(), playlist_(), current_playlist_index_(0), is_playlist_mode_(false),
+                         playlist_random_(false), playlist_type_() {
     ESP_LOGI(TAG, "Music player initialized");
     InitializeMp3Decoder();
 }
@@ -207,8 +209,186 @@ Esp32Music::~Esp32Music() {
     ClearAudioBuffer();
     CleanupMp3Decoder();
     
+    // clear playlist
+    ClearPlaylist();
+    
     ESP_LOGI(TAG, "Music player destroyed successfully");
 }
+
+// ---------- Playlist helpers ----------
+size_t Esp32Music::GetPlaylistSize() const {
+    std::lock_guard<std::mutex> lock(playlist_mutex_);
+    return playlist_.size();
+}
+
+void Esp32Music::ClearPlaylist() {
+    std::lock_guard<std::mutex> lock(playlist_mutex_);
+    playlist_.clear();
+    current_playlist_index_ = 0;
+    is_playlist_mode_ = false;
+    playlist_random_ = false;
+    playlist_type_.clear();
+}
+
+bool Esp32Music::SetPlaylistFromJson(const std::string& json) {
+    if (json.empty()) return false;
+    cJSON* root = cJSON_Parse(json.c_str());
+    if (!root) return false;
+
+    std::vector<PlaylistTrack> tmp;
+    bool random_flag = false;
+    std::string pl_type;
+    int start_index = 0;
+
+    // try top-level playlist array
+    cJSON* playlistArr = cJSON_GetObjectItem(root, "playlist");
+    if (!playlistArr) {
+        // maybe the root itself is an array
+        if (cJSON_IsArray(root)) playlistArr = root;
+    }
+    if (playlistArr && cJSON_IsArray(playlistArr)) {
+        int cnt = cJSON_GetArraySize(playlistArr);
+        for (int i = 0; i < cnt; ++i) {
+            cJSON* item = cJSON_GetArrayItem(playlistArr, i);
+            if (!item) continue;
+            PlaylistTrack t;
+            cJSON* j;
+
+            j = cJSON_GetObjectItem(item, "id");
+            if (j && cJSON_IsString(j)) t.id = j->valuestring;
+            j = cJSON_GetObjectItem(item, "title");
+            if (j && cJSON_IsString(j)) t.title = j->valuestring;
+            j = cJSON_GetObjectItem(item, "artist");
+            if (j && cJSON_IsString(j)) t.artist = j->valuestring;
+            j = cJSON_GetObjectItem(item, "album");
+            if (j && cJSON_IsString(j)) t.album = j->valuestring;
+            j = cJSON_GetObjectItem(item, "audio_url");
+            if (j && cJSON_IsString(j)) t.audio_url = j->valuestring;
+            j = cJSON_GetObjectItem(item, "lyric_url");
+            if (j && cJSON_IsString(j)) t.lyric_url = j->valuestring;
+
+            if (!t.audio_url.empty()) tmp.push_back(std::move(t));
+        }
+    }
+
+    // flags
+    cJSON* r = cJSON_GetObjectItem(root, "random");
+    if (r && cJSON_IsBool(r)) random_flag = cJSON_IsTrue(r);
+    cJSON* t = cJSON_GetObjectItem(root, "playlist_type");
+    if (t && cJSON_IsString(t)) pl_type = t->valuestring;
+    cJSON* idx = cJSON_GetObjectItem(root, "current_index");
+    if (idx && cJSON_IsNumber(idx)) start_index = (int)idx->valuedouble;
+
+    cJSON_Delete(root);
+
+    if (tmp.empty()) return false;
+
+    {
+        std::lock_guard<std::mutex> lock(playlist_mutex_);
+        playlist_ = std::move(tmp);
+        playlist_random_ = random_flag;
+        playlist_type_ = pl_type;
+        is_playlist_mode_ = true;
+        // clamp start_index
+        if (start_index < 0) start_index = 0;
+        if (start_index >= (int)playlist_.size()) start_index = 0;
+        current_playlist_index_ = start_index;
+
+        if (playlist_random_) {
+            // shuffle preserving current index as first element
+            std::mt19937 rng((unsigned)esp_timer_get_time());
+            std::shuffle(playlist_.begin(), playlist_.end(), rng);
+            // reset index to 0 after shuffle
+            current_playlist_index_ = 0;
+        }
+    }
+    return true;
+}
+
+// Internal: play a specific playlist index (thread-safe)
+bool Esp32Music::PlayTrackInternal(int index) {
+    PlaylistTrack track;
+    {
+        std::lock_guard<std::mutex> lock(playlist_mutex_);
+        if (index < 0 || index >= (int)playlist_.size()) return false;
+        track = playlist_[index];
+    }
+
+    // stop current streaming (signal threads)
+    StopStreaming();
+
+    // set current metadata
+    current_music_url_ = track.audio_url;
+    current_song_name_ = track.title.empty() ? (track.artist + " - track") : track.title;
+    if (!track.lyric_url.empty()) {
+        current_lyric_url_ = track.lyric_url;
+    } else {
+        current_lyric_url_.clear();
+    }
+
+    // reset lyric thread
+    if (is_lyric_running_) {
+        is_lyric_running_ = false;
+        if (lyric_thread_.joinable()) lyric_thread_.join();
+    }
+    is_lyric_running_ = true;
+    current_lyric_index_ = -1;
+    {
+        std::lock_guard<std::mutex> l(lyrics_mutex_);
+        lyrics_.clear();
+    }
+    lyric_thread_ = std::thread(&Esp32Music::LyricDisplayThread, this);
+
+    // start streaming new track
+    return StartStreaming(current_music_url_);
+}
+
+bool Esp32Music::PlayNextInPlaylist() {
+    std::lock_guard<std::mutex> lock(playlist_mutex_);
+    if (playlist_.empty()) return false;
+    int next = current_playlist_index_ + 1;
+    if (next >= (int)playlist_.size()) {
+        // no wrap by default
+        return false;
+    }
+    current_playlist_index_ = next;
+    int idx = current_playlist_index_;
+    // unlock then play
+    // play outside lock to avoid deadlocks
+    // copy track index
+    // call PlayTrackInternal
+    return PlayTrackInternal(idx);
+}
+
+bool Esp32Music::PlayPrevInPlaylist() {
+    std::lock_guard<std::mutex> lock(playlist_mutex_);
+    if (playlist_.empty()) return false;
+    int prev = current_playlist_index_ - 1;
+    if (prev < 0) return false;
+    current_playlist_index_ = prev;
+    int idx = current_playlist_index_;
+    return PlayTrackInternal(idx);
+}
+
+bool Esp32Music::Next() {
+    // public wrapper
+    if (!is_playlist_mode_) return false;
+    return PlayNextInPlaylist();
+}
+
+bool Esp32Music::Prev() {
+    if (!is_playlist_mode_) return false;
+    return PlayPrevInPlaylist();
+}
+
+bool Esp32Music::PlayTrackAt(int index) {
+    std::lock_guard<std::mutex> lock(playlist_mutex_);
+    if (index < 0 || index >= (int)playlist_.size()) return false;
+    current_playlist_index_ = index;
+    return PlayTrackInternal(index);
+}
+
+// ------------ 以上 playlist 代码 end --------------
 
 // Download (request metadata)
 bool Esp32Music::Download(const std::string& song_name) {
@@ -224,10 +404,17 @@ bool Esp32Music::Download(const std::string& song_name) {
     ESP_LOGI(TAG, "Request URL: %s", full_url.c_str());
     
     auto network = Board::GetInstance().GetNetwork();
+    // CreateHttp 返回 std::unique_ptr<Http>（在你的工程中如此），所以用 auto 接受
     auto http = network->CreateHttp(0);
+    if (!http) {
+        ESP_LOGE(TAG, "Failed to create http client");
+        return false;
+    }
     
     http->SetHeader("User-Agent", "ESP32-Music-Player/1.0");
     http->SetHeader("Accept", "application/json");
+    // 注意：CreateHttp 返回 unique_ptr，所以传入需要 Http* 的函数时用 .get()
+    add_auth_headers(http.get()); // <-- 修正点：使用 .get()
     
     if (!http->Open("GET", full_url)) {
         ESP_LOGE(TAG, "Failed to connect to music API");
@@ -244,10 +431,24 @@ bool Esp32Music::Download(const std::string& song_name) {
     last_downloaded_data_ = http->ReadAll();
     http->Close();
     
-    ESP_LOGI(TAG, "HTTP GET Status = %d, content_length = %d", status_code, last_downloaded_data_.length());
+    ESP_LOGI(TAG, "HTTP GET Status = %d, content_length = %d", status_code, (int)last_downloaded_data_.length());
     ESP_LOGD(TAG, "Complete music details response: %s", last_downloaded_data_.c_str());
     
     if (!last_downloaded_data_.empty()) {
+        // first try to parse playlist if present
+        if (SetPlaylistFromJson(last_downloaded_data_)) {
+            // playlist constructed successfully -> play first track
+            ESP_LOGI(TAG, "Playlist parsed and set, size=%d", (int)GetPlaylistSize());
+            int idx = 0;
+            {
+                std::lock_guard<std::mutex> lock(playlist_mutex_);
+                idx = current_playlist_index_;
+            }
+            PlayTrackInternal(idx);
+            return true;
+        }
+
+        // otherwise parse single-track response (existing behavior)
         cJSON* response_json = cJSON_Parse(last_downloaded_data_.c_str());
         if (response_json) {
             cJSON* artist = cJSON_GetObjectItem(response_json, "artist");
@@ -265,6 +466,9 @@ bool Esp32Music::Download(const std::string& song_name) {
             if (cJSON_IsString(audio_url) && audio_url->valuestring && strlen(audio_url->valuestring) > 0) {
                 ESP_LOGI(TAG, "Audio URL path: %s", audio_url->valuestring);
                 
+                // single track mode: clear playlist mode
+                ClearPlaylist();
+
                 current_music_url_ = audio_url->valuestring;
                                 
                 ESP_LOGI(TAG, "Starting streaming playback for: %s", song_name.c_str());
@@ -318,13 +522,16 @@ bool Esp32Music::Play() {
         return true;
     }
     
-    if (last_downloaded_data_.empty()) {
+    if (last_downloaded_data_.empty() && current_music_url_.empty()) {
         ESP_LOGE(TAG, "No music data to play");
         return false;
     }
     
     if (play_thread_.joinable()) {
-        play_thread_.join();
+        // join only if not current thread
+        if (play_thread_.get_id() != std::this_thread::get_id()) {
+            play_thread_.join();
+        }
     }
     
     return StartStreaming(current_music_url_);
@@ -348,10 +555,10 @@ bool Esp32Music::Stop() {
         buffer_cv_.notify_all();
     }
     
-    if (download_thread_.joinable()) {
+    if (download_thread_.joinable() && download_thread_.get_id() != std::this_thread::get_id()) {
         download_thread_.join();
     }
-    if (play_thread_.joinable()) {
+    if (play_thread_.joinable() && play_thread_.get_id() != std::this_thread::get_id()) {
         play_thread_.join();
     }
     
@@ -373,17 +580,19 @@ bool Esp32Music::StartStreaming(const std::string& music_url) {
     
     ESP_LOGD(TAG, "Starting streaming for URL: %s", music_url.c_str());
     
+    // set flags so download/play loops can stop
     is_downloading_ = false;
     is_playing_ = false;
     
-    if (download_thread_.joinable()) {
+    // join previous threads if they are joinable and not current thread
+    if (download_thread_.joinable() && download_thread_.get_id() != std::this_thread::get_id()) {
         {
             std::lock_guard<std::mutex> lock(buffer_mutex_);
             buffer_cv_.notify_all();
         }
         download_thread_.join();
     }
-    if (play_thread_.joinable()) {
+    if (play_thread_.joinable() && play_thread_.get_id() != std::this_thread::get_id()) {
         {
             std::lock_guard<std::mutex> lock(buffer_mutex_);
             buffer_cv_.notify_all();
@@ -797,6 +1006,13 @@ void Esp32Music::PlayAudioStream() {
     ESP_LOGI(TAG, "Audio stream playback finished, total played: %zu bytes", total_played);
     
     is_playing_ = false;
+
+    // playback finished -> handle playlist auto-next
+    try {
+        OnPlaybackFinished();
+    } catch (...) {
+        ESP_LOGW(TAG, "OnPlaybackFinished threw exception");
+    }
 }
 
 // Clear audio buffer
@@ -980,7 +1196,7 @@ bool Esp32Music::DownloadLyrics(const std::string& lyric_url) {
                 break;
             } else {
                 if (!lyric_content.empty()) {
-                    ESP_LOGW(TAG, "HTTP read returned %d, but we have data (%d bytes), continuing", bytes_read, lyric_content.length());
+                    ESP_LOGW(TAG, "HTTP read returned %d, but we have data (%d bytes), continuing", bytes_read, (int)lyric_content.length());
                     success = true;
                     break;
                 } else {
@@ -1220,5 +1436,48 @@ void Esp32Music::UpdateLyricDisplay(int64_t current_time_ms) {
             display->SetChatMessage("lyric", lyric_text.c_str());
             ESP_LOGD(TAG, "Lyric update at %lldms: %s", current_time_ms, lyric_text.empty() ? "(no lyric)" : lyric_text.c_str());
         }
+    }
+}
+
+// 当一首歌播放结束时调用（在 PlayAudioStream 线程结束后会触发）
+void Esp32Music::OnPlaybackFinished() {
+    // If in playlist mode, attempt to play next track automatically
+    bool playlist_mode = false;
+    {
+        std::lock_guard<std::mutex> lock(playlist_mutex_);
+        playlist_mode = is_playlist_mode_;
+    }
+    if (!playlist_mode) return;
+
+    // try to advance to next
+    bool advanced = false;
+    {
+        std::lock_guard<std::mutex> lock(playlist_mutex_);
+        if (!playlist_.empty()) {
+            int next = current_playlist_index_ + 1;
+            if (next < (int)playlist_.size()) {
+                current_playlist_index_ = next;
+                advanced = true;
+            } else {
+                // reached end -> no wrap by default
+                advanced = false;
+            }
+        }
+    }
+
+    if (advanced) {
+        // play the next track
+        int idx;
+        {
+            std::lock_guard<std::mutex> lock(playlist_mutex_);
+            idx = current_playlist_index_;
+        }
+        // Start next track asynchronously (so we don't call StartStreaming from within the just-exited playback thread in ambiguous states)
+        // But StartStreaming can be called safely here because play_thread_ is no longer joinable (this thread was play_thread_).
+        // To be conservative we spawn a small detached thread to start the next stream.
+        std::thread t([this, idx]() {
+            PlayTrackInternal(idx);
+        });
+        t.detach();
     }
 }
