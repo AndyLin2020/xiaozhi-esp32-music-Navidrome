@@ -83,6 +83,38 @@ Esp32Music::Esp32Music() : last_downloaded_data_(), current_music_url_(), curren
     g_esp32_music_instance = this;
     ESP_LOGI(TAG, "Music player initialized");
     InitializeMp3Decoder();
+	
+	// 启动 lyric worker
+	lyric_worker_running_.store(true);
+	lyric_worker_thread_ = std::thread([this]() {
+		// NOTE: don't call pthread_setname_np() here — not available in some IDF/toolchain builds.
+		while (lyric_worker_running_.load()) {
+			std::unique_lock<std::mutex> lk(this->lyric_worker_mutex_);
+			this->lyric_worker_cv_.wait(lk, [this]() {
+				return !this->lyric_worker_req_url_.empty() || !this->lyric_worker_running_.load();
+			});
+			if (!this->lyric_worker_running_.load()) break;
+			// move URL out
+			std::string url = std::move(this->lyric_worker_req_url_);
+			this->lyric_worker_req_url_.clear();
+			// release lock while doing network IO
+			lk.unlock();
+
+			// Mark busy
+			this->lyric_worker_busy_.store(true);
+
+			// 同步下载并解析歌词（DownloadLyricsSync 应该是阻塞式实现）
+			try {
+				(void) DownloadLyricsSync(url);
+			} catch (const std::exception &e) {
+				ESP_LOGE(TAG, "Lyric worker DownloadLyricsSync exception: %s", e.what());
+			} catch (...) {
+				ESP_LOGE(TAG, "Lyric worker DownloadLyricsSync unknown exception");
+			}
+
+			this->lyric_worker_busy_.store(false);
+		}
+	});
 }
 
 Esp32Music::~Esp32Music() {
@@ -171,6 +203,18 @@ Esp32Music::~Esp32Music() {
     
 	// ... 原有清理逻辑 ...
     g_esp32_music_instance = nullptr;
+	
+	// 停止 lyric worker
+	lyric_worker_running_.store(false);
+	{
+		std::lock_guard<std::mutex> lk(lyric_worker_mutex_);
+		lyric_worker_req_url_.clear();
+	}
+	lyric_worker_cv_.notify_all();
+	if (lyric_worker_thread_.joinable()) {
+		lyric_worker_thread_.join();
+	}
+
     ESP_LOGI(TAG, "Music player destroyed successfully");
 }
 
@@ -1109,27 +1153,26 @@ void Esp32Music::AbortCurrentLyricHttp() {
     }
 }
 
-// Download lyrics (enhanced)
-bool Esp32Music::DownloadLyrics(const std::string& lyric_url) {
+bool Esp32Music::DownloadLyricsSync(const std::string& lyric_url) {
     ESP_LOGI(TAG, "Downloading lyrics from: %s", lyric_url.c_str());
-    
+
     if (lyric_url.empty()) {
         ESP_LOGE(TAG, "Lyric URL is empty!");
         return false;
     }
-    
+
     const int max_retries = 3;
     int retry_count = 0;
     bool success = false;
     std::string lyric_content;
     std::string current_url = lyric_url;
-    
+
     while (retry_count < max_retries && !success) {
         if (retry_count > 0) {
             ESP_LOGI(TAG, "Retrying lyric download (attempt %d of %d)", retry_count + 1, max_retries);
             std::this_thread::sleep_for(std::chrono::milliseconds(500));
         }
-        
+
         auto network = Board::GetInstance().GetNetwork();
         {
             std::lock_guard<std::mutex> lock(lyric_http_mutex_);
@@ -1138,6 +1181,7 @@ bool Esp32Music::DownloadLyrics(const std::string& lyric_url) {
         if (!current_lyric_http_) {
             ESP_LOGE(TAG, "Failed to create HTTP client for lyric download");
             retry_count++;
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
             continue;
         }
 
@@ -1153,7 +1197,7 @@ bool Esp32Music::DownloadLyrics(const std::string& lyric_url) {
             continue;
         }
 
-        http->SetHeader("User-Agent", "ESP32-Music-Player/1.0");
+        // 设置请求头（与现有 http 使用一致）
         http->SetHeader("Accept", "text/plain");
         add_auth_headers(http);
 
@@ -1182,24 +1226,28 @@ bool Esp32Music::DownloadLyrics(const std::string& lyric_url) {
             continue;
         }
 
+        // 使用堆缓冲读取（避免大栈数组）
         lyric_content.clear();
-        char buffer[1024];
-        int bytes_read;
+        std::vector<char> buffer;
+        buffer.resize(1024);
+
         bool read_error = false;
         int total_read = 0;
-
         while (true) {
-            bytes_read = http->Read(buffer, sizeof(buffer) - 1);
+            // 注意：Read 返回 >0 表示读取到字节，0 表示 EOF，<0 表示 error（你的 Http impl 语义）
+            int bytes_read = http->Read(buffer.data(), static_cast<int>(buffer.size() - 1));
             if (bytes_read > 0) {
-                buffer[bytes_read] = '\0';
-                lyric_content += buffer;
+                // 确保字符串拼接安全
+                lyric_content.append(buffer.data(), bytes_read);
                 total_read += bytes_read;
             } else if (bytes_read == 0) {
+                // 正常结束
                 success = true;
                 break;
             } else {
+                // 错误
                 if (!lyric_content.empty()) {
-                    ESP_LOGW(TAG, "HTTP read returned %d, but we have data (%d bytes), continuing", bytes_read, (int)lyric_content.length());
+                    ESP_LOGW(TAG, "HTTP read returned %d, but we have data (%d bytes), proceeding.", bytes_read, (int)lyric_content.length());
                     success = true;
                     break;
                 } else {
@@ -1209,6 +1257,7 @@ bool Esp32Music::DownloadLyrics(const std::string& lyric_url) {
                 }
             }
 
+            // 支持外部中止（兼容 AbortCurrentLyricHttp）
             if (!is_lyric_running_.load()) {
                 ESP_LOGI(TAG, "Lyric download aborted by stop flag");
                 read_error = true;
@@ -1216,16 +1265,24 @@ bool Esp32Music::DownloadLyrics(const std::string& lyric_url) {
             }
         }
 
+        // 关闭并清理 current_lyric_http_
         http->Close();
-        AbortCurrentLyricHttp();
+        {
+            std::lock_guard<std::mutex> lock(lyric_http_mutex_);
+            current_lyric_http_.reset();
+        }
 
         if (read_error) {
             retry_count++;
             continue;
         }
 
-        if (success) break;
-    }
+        // 如果下载成功但内容为空，视为无歌词
+        if (success && lyric_content.empty()) {
+            ESP_LOGI(TAG, "Downloaded lyric content empty (success but zero length).");
+            return false;
+        }
+    } // end retries
 
     if (retry_count >= max_retries) {
         ESP_LOGE(TAG, "Failed to download lyrics after %d attempts", max_retries);
@@ -1238,8 +1295,9 @@ bool Esp32Music::DownloadLyrics(const std::string& lyric_url) {
     }
 
     ESP_LOGI(TAG, "Lyrics downloaded successfully, size: %d bytes", (int)lyric_content.length());
+    // 将字符串传给现有解析器（ParseLyrics 接受 std::string）
     return ParseLyrics(lyric_content);
-} 
+}
 
 // 替换版 ParseLyrics：同时支持 LRC 和 JSON(line数组) 两种格式
 bool Esp32Music::ParseLyrics(const std::string& lyric_content) {
@@ -1291,23 +1349,58 @@ bool Esp32Music::ParseLyrics(const std::string& lyric_content) {
 // Lyric display thread
 void Esp32Music::LyricDisplayThread() {
     ESP_LOGI(TAG, "Lyric display thread started.");
-    
-    if (!current_lyric_url_.empty()) {
-        ESP_LOGI(TAG, "Downloading external lyrics...");
-        if (!DownloadLyrics(current_lyric_url_)) {
-            ESP_LOGW(TAG, "Failed to download or parse external lyrics.");
+
+    // 如果存在外部歌词 URL，则在这个线程内同步下载并解析（DownloadLyricsSync 应该填充 lyrics_）
+    {
+        std::string lyric_url_copy;
+        {
+            std::lock_guard<std::mutex> l(lyrics_mutex_);
+            lyric_url_copy = current_lyric_url_;
         }
-        current_lyric_url_.clear();
-    } else {
-        ESP_LOGI(TAG, "Waiting for embedded lyrics to be parsed...");
+
+        if (!lyric_url_copy.empty()) {
+            ESP_LOGI(TAG, "Downloading external lyrics...");
+            // 调用你的同步版本下载/解析函数（如果你把名字定为 DownloadLyricsSync）
+            bool ok = false;
+            try {
+                ok = DownloadLyricsSync(lyric_url_copy); // <- 确保头文件有声明
+            } catch (const std::exception &e) {
+                ESP_LOGE(TAG, "DownloadLyricsSync threw exception: %s", e.what());
+                ok = false;
+            } catch (...) {
+                ESP_LOGE(TAG, "DownloadLyricsSync threw unknown exception");
+                ok = false;
+            }
+
+            if (!ok) {
+                ESP_LOGW(TAG, "Failed to download or parse external lyrics for url=%s", lyric_url_copy.c_str());
+            } else {
+                // 打日志显示解析到多少行（使用已有数据结构）
+                {
+                    std::lock_guard<std::mutex> l(lyrics_mutex_);
+                    ESP_LOGI(TAG, "Lyrics parsed, lines=%u", (unsigned)lyrics_.size());
+                }
+            }
+
+            // 清空 current_lyric_url_（防止重复下载）
+            {
+                std::lock_guard<std::mutex> l(lyrics_mutex_);
+                current_lyric_url_.clear();
+            }
+        } else {
+            ESP_LOGI(TAG, "No external lyric URL, will wait for embedded lyrics if any.");
+        }
     }
 
+    // 原有逻辑：循环等待播放状态改变（播放线程会周期性调用 UpdateLyricDisplay(current_play_time_ms)）
+    // 当 is_lyric_running_ 或 is_playing_ 变为 false 时线程退出
     while (is_lyric_running_.load() && is_playing_.load()) {
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
     }
-    
+
     ESP_LOGI(TAG, "Lyric display thread finished.");
 }
+
 
 void Esp32Music::UpdateLyricDisplay(int64_t current_time_ms) {
     std::lock_guard<std::mutex> lock(lyrics_mutex_);
@@ -1450,7 +1543,15 @@ void Esp32Music::NextPlaylistTrack() {
         std::lock_guard<std::mutex> l(lyrics_mutex_);
         lyrics_.clear();
     }
-    lyric_thread_ = std::thread(&Esp32Music::LyricDisplayThread, this);
+    //lyric_thread_ = std::thread(&Esp32Music::LyricDisplayThread, this);
+	
+	// 通知 lyric worker 去下载/解析并更新歌词
+	{
+		std::lock_guard<std::mutex> lk(lyric_worker_mutex_);
+		lyric_worker_req_url_ = current_lyric_url_; // 用 current_lyric_url_ 字符串
+	}
+	lyric_worker_cv_.notify_one();
+
 
     // ------------------------ 停止旧下载/播放线程并清理缓冲 ------------------------
     // 先请求停止下载/播放线程

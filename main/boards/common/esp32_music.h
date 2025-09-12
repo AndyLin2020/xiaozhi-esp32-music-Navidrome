@@ -152,6 +152,14 @@ private:
     bool is_playlist_mode_;
     bool playlist_random_;
     std::string playlist_type_;
+	
+	// ---- 新增：持久化的歌词 worker 线程相关 ----
+	std::thread lyric_worker_thread_;              // 长期运行的歌词 worker 线程
+	std::atomic<bool> lyric_worker_running_{false}; // worker 生存标志
+	std::mutex lyric_worker_mutex_;
+	std::condition_variable lyric_worker_cv_;
+	std::string lyric_worker_req_url_;             // 待处理的歌词 URL（一次只处理一个）
+	std::atomic<bool> lyric_worker_busy_{false};   // worker 是否正忙
 
     // 私有方法
     void DownloadAudioStream(const std::string& music_url);
@@ -163,8 +171,8 @@ private:
     size_t SkipId3Tag(uint8_t* data, size_t size);
     std::string ExtractLyricsFromId3(const uint8_t* data, size_t size);
 
-    // 歌词相关方法（修复：函数名统一为 DownloadLyrics）
-    bool DownloadLyrics(const std::string& lyric_url);  // 最新歌词下载函数
+    // 歌词相关方法（修复：函数名统一为 DownloadLyricsSync） 
+	bool DownloadLyricsSync(const std::string& lyric_url);// 最新歌词下载函数
     bool ParseLyrics(const std::string& lyric_content); // 自动解析LRC/JSON歌词
     void ParseLrcLyrics(const std::string& lyric_data); // 单独解析LRC歌词
     void LyricDisplayThread();
