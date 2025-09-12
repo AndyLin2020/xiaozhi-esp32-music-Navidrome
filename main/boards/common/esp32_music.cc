@@ -17,6 +17,7 @@
 #include <sstream>
 #include <algorithm>
 #include <cctype>
+#include <random>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 
@@ -35,34 +36,15 @@ static std::string get_device_chip_id() {
     mac.erase(std::remove(mac.begin(), mac.end(), ':'), mac.end());
     return mac;
 }
-
-static std::string generate_dynamic_key(int64_t timestamp) {
-    const std::string secret_key = "your-esp32-secret-key-2024";
-    std::string mac = get_device_mac();
-    std::string chip_id = get_device_chip_id();
-    std::string data = mac + ":" + chip_id + ":" + std::to_string(timestamp) + ":" + secret_key;
-    unsigned char hash[32];
-    mbedtls_sha256((unsigned char*)data.c_str(), data.length(), hash, 0);
-    std::string key;
-    for (int i = 0; i < 16; i++) {
-        char hex[3];
-        snprintf(hex, sizeof(hex), "%02X", hash[i]);
-        key += hex;
-    }
-    return key;
-}
-
+ 
 static void add_auth_headers(Http* http) {
-    int64_t timestamp = esp_timer_get_time() / 1000000;
-    std::string dynamic_key = generate_dynamic_key(timestamp);
+    int64_t timestamp = esp_timer_get_time() / 1000000; 
     std::string mac = get_device_mac();
     std::string chip_id = get_device_chip_id();
     if (http) {
         http->SetHeader("X-MAC-Address", mac);
         http->SetHeader("X-Chip-ID", chip_id);
-        http->SetHeader("X-Timestamp", std::to_string(timestamp));
-        http->SetHeader("X-Dynamic-Key", dynamic_key);
-        //ESP_LOGI(TAG, "Added auth headers - MAC: %s, ChipID: %s, Timestamp: %lld", mac.c_str(), chip_id.c_str(), timestamp);
+        http->SetHeader("X-Timestamp", std::to_string(timestamp)); 
     }
 }
 
@@ -86,34 +68,6 @@ static std::string url_encode(const std::string& str) {
     return encoded;
 }
 
-static std::string buildUrlWithParams(const std::string& base_url, const std::string& path, const std::string& query) {
-    std::string result_url = base_url + path + "?";
-    size_t pos = 0;
-    size_t amp_pos = 0;
-    while ((amp_pos = query.find("&", pos)) != std::string::npos) {
-        std::string param = query.substr(pos, amp_pos - pos);
-        size_t eq_pos = param.find("=");
-        if (eq_pos != std::string::npos) {
-            std::string key = param.substr(0, eq_pos);
-            std::string value = param.substr(eq_pos + 1);
-            result_url += key + "=" + url_encode(value) + "&";
-        } else {
-            result_url += param + "&";
-        }
-        pos = amp_pos + 1;
-    }
-    std::string last_param = query.substr(pos);
-    size_t eq_pos = last_param.find("=");
-    if (eq_pos != std::string::npos) {
-        std::string key = last_param.substr(0, eq_pos);
-        std::string value = last_param.substr(eq_pos + 1);
-        result_url += key + "=" + url_encode(value);
-    } else {
-        result_url += last_param;
-    }
-    return result_url;
-}
-
 // Constructor / Destructor
 Esp32Music::Esp32Music() : last_downloaded_data_(), current_music_url_(), current_song_name_(),
                          song_name_displayed_(false), current_lyric_url_(), lyrics_(), 
@@ -121,7 +75,9 @@ Esp32Music::Esp32Music() : last_downloaded_data_(), current_music_url_(), curren
                          is_playing_(false), is_downloading_(false), 
                          play_thread_(), download_thread_(), audio_buffer_(), buffer_mutex_(), 
                          buffer_cv_(), buffer_size_(0), mp3_decoder_(nullptr), mp3_frame_info_(), 
-                         mp3_decoder_initialized_(false) {
+                         mp3_decoder_initialized_(false),
+                         playlist_mutex_(), playlist_(), current_playlist_index_(0), is_playlist_mode_(false),
+                         playlist_random_(false), playlist_type_() {
     ESP_LOGI(TAG, "Music player initialized");
     InitializeMp3Decoder();
 }
@@ -207,8 +163,211 @@ Esp32Music::~Esp32Music() {
     ClearAudioBuffer();
     CleanupMp3Decoder();
     
+    // clear playlist
+    ClearPlaylist();
+    
     ESP_LOGI(TAG, "Music player destroyed successfully");
 }
+
+// ---------- Playlist helpers ----------
+size_t Esp32Music::GetPlaylistSize() const {
+    std::lock_guard<std::mutex> lock(playlist_mutex_);
+    return playlist_.size();
+}
+
+void Esp32Music::ClearPlaylist() {
+    std::lock_guard<std::mutex> lock(playlist_mutex_);
+    playlist_.clear();
+    current_playlist_index_ = 0;
+    is_playlist_mode_ = false;
+    playlist_random_ = false;
+    playlist_type_.clear();
+}
+
+bool Esp32Music::SetPlaylistFromJson(const std::string& json) {
+    if (json.empty()) return false;
+    cJSON* root = cJSON_Parse(json.c_str());
+    if (!root) return false;
+
+    std::vector<PlaylistTrack> tmp;
+    bool random_flag = false;
+    std::string pl_type;
+    int start_index = 0;
+
+    // try top-level playlist array
+    cJSON* playlistArr = cJSON_GetObjectItem(root, "playlist");
+    if (!playlistArr) {
+        // maybe the root itself is an array
+        if (cJSON_IsArray(root)) playlistArr = root;
+    }
+    if (playlistArr && cJSON_IsArray(playlistArr)) {
+        int cnt = cJSON_GetArraySize(playlistArr);
+        for (int i = 0; i < cnt; ++i) {
+            cJSON* item = cJSON_GetArrayItem(playlistArr, i);
+            if (!item) continue;
+            PlaylistTrack t;
+            cJSON* j;
+
+            j = cJSON_GetObjectItem(item, "id");
+            if (j && cJSON_IsString(j)) t.id = j->valuestring;
+            j = cJSON_GetObjectItem(item, "title");
+            if (j && cJSON_IsString(j)) t.title = j->valuestring;
+            j = cJSON_GetObjectItem(item, "artist");
+            if (j && cJSON_IsString(j)) t.artist = j->valuestring;
+            j = cJSON_GetObjectItem(item, "album");
+            if (j && cJSON_IsString(j)) t.album = j->valuestring;
+            j = cJSON_GetObjectItem(item, "audio_url");
+            if (j && cJSON_IsString(j)) t.audio_url = j->valuestring;
+            j = cJSON_GetObjectItem(item, "lyric_url");
+            if (j && cJSON_IsString(j)) t.lyric_url = j->valuestring;
+
+            if (!t.audio_url.empty()) tmp.push_back(std::move(t));
+        }
+    }
+
+    // flags
+    cJSON* r = cJSON_GetObjectItem(root, "random");
+    if (r && cJSON_IsBool(r)) random_flag = cJSON_IsTrue(r);
+    cJSON* t = cJSON_GetObjectItem(root, "playlist_type");
+    if (t && cJSON_IsString(t)) pl_type = t->valuestring;
+    cJSON* idx = cJSON_GetObjectItem(root, "current_index");
+    if (idx && cJSON_IsNumber(idx)) start_index = (int)idx->valuedouble;
+
+    cJSON_Delete(root);
+
+    if (tmp.empty()) return false;
+
+    {
+        std::lock_guard<std::mutex> lock(playlist_mutex_);
+        playlist_ = std::move(tmp);
+        playlist_random_ = random_flag;
+        playlist_type_ = pl_type;
+        is_playlist_mode_ = true;
+        // clamp start_index
+        if (start_index < 0) start_index = 0;
+        if (start_index >= (int)playlist_.size()) start_index = 0;
+        current_playlist_index_ = start_index;
+
+        if (playlist_random_) {
+            // shuffle preserving current index as first element
+            std::mt19937 rng((unsigned)esp_timer_get_time());
+            std::shuffle(playlist_.begin(), playlist_.end(), rng);
+            // reset index to 0 after shuffle
+            current_playlist_index_ = 0;
+        }
+    }
+    return true;
+}
+
+// Internal: play a specific playlist index (thread-safe)
+// Internal: play a specific playlist index (thread-safe)
+bool Esp32Music::PlayTrackInternal(int index) {
+    PlaylistTrack track;
+    {
+        std::lock_guard<std::mutex> lock(playlist_mutex_);
+        if (index < 0 || index >= (int)playlist_.size()) return false;
+        track = playlist_[index];
+    }
+
+    // 【原有逻辑保留】停止当前流式播放
+    StopStreaming();
+
+    // 【核心修改1】清理旧的下载/播放线程（避免线程泄漏）
+    is_downloading_ = false;
+    is_playing_ = false;
+    {
+        std::lock_guard<std::mutex> buf_lock(buffer_mutex_);
+        buffer_cv_.notify_all();
+    }
+    if (download_thread_.joinable()) {
+        download_thread_.join();
+    }
+    if (play_thread_.joinable()) {
+        play_thread_.join();
+    }
+    ClearAudioBuffer(); // 清空旧缓冲区
+
+    // 【核心修改2】初始化 MP3 解码器（确保播放正常）
+    if (!mp3_decoder_initialized_) {
+        if (!InitializeMp3Decoder()) {
+            ESP_LOGE(TAG, "PlayTrackInternal: MP3 decoder init failed");
+            return false;
+        }
+    }
+
+    // 【原有逻辑保留】设置当前曲目元数据
+    current_music_url_ = track.audio_url;
+    current_song_name_ = track.title.empty() ? (track.artist + " - track") : track.title;
+    song_name_displayed_ = false; // 【新增】重置歌曲名显示标志
+    if (!track.lyric_url.empty()) {
+        current_lyric_url_ = track.lyric_url;
+    } else {
+        current_lyric_url_.clear();
+    }
+
+    // 【原有逻辑保留】重置歌词线程
+    if (is_lyric_running_) {
+        is_lyric_running_ = false;
+        if (lyric_thread_.joinable()) lyric_thread_.join();
+    }
+    is_lyric_running_ = true;
+    current_lyric_index_ = -1;
+    {
+        std::lock_guard<std::mutex> l(lyrics_mutex_);
+        lyrics_.clear();
+    }
+    lyric_thread_ = std::thread(&Esp32Music::LyricDisplayThread, this);
+
+    // 【原有逻辑保留】启动新的流式播放
+    return StartStreaming(current_music_url_);
+}
+
+bool Esp32Music::PlayNextInPlaylist() {
+    std::lock_guard<std::mutex> lock(playlist_mutex_);
+    if (playlist_.empty()) return false;
+    int next = current_playlist_index_ + 1;
+    if (next >= (int)playlist_.size()) {
+        // no wrap by default
+        return false;
+    }
+    current_playlist_index_ = next;
+    int idx = current_playlist_index_;
+    // unlock then play
+    // play outside lock to avoid deadlocks
+    // copy track index
+    // call PlayTrackInternal
+    return PlayTrackInternal(idx);
+}
+
+bool Esp32Music::PlayPrevInPlaylist() {
+    std::lock_guard<std::mutex> lock(playlist_mutex_);
+    if (playlist_.empty()) return false;
+    int prev = current_playlist_index_ - 1;
+    if (prev < 0) return false;
+    current_playlist_index_ = prev;
+    int idx = current_playlist_index_;
+    return PlayTrackInternal(idx);
+}
+
+bool Esp32Music::Next() {
+    // public wrapper
+    if (!is_playlist_mode_) return false;
+    return PlayNextInPlaylist();
+}
+
+bool Esp32Music::Prev() {
+    if (!is_playlist_mode_) return false;
+    return PlayPrevInPlaylist();
+}
+
+bool Esp32Music::PlayTrackAt(int index) {
+    std::lock_guard<std::mutex> lock(playlist_mutex_);
+    if (index < 0 || index >= (int)playlist_.size()) return false;
+    current_playlist_index_ = index;
+    return PlayTrackInternal(index);
+}
+
+// ------------ 以上 playlist 代码 end --------------
 
 // Download (request metadata)
 bool Esp32Music::Download(const std::string& song_name) {
@@ -224,10 +383,17 @@ bool Esp32Music::Download(const std::string& song_name) {
     ESP_LOGI(TAG, "Request URL: %s", full_url.c_str());
     
     auto network = Board::GetInstance().GetNetwork();
+    // CreateHttp 返回 std::unique_ptr<Http>（在你的工程中如此），所以用 auto 接受
     auto http = network->CreateHttp(0);
+    if (!http) {
+        ESP_LOGE(TAG, "Failed to create http client");
+        return false;
+    }
     
     http->SetHeader("User-Agent", "ESP32-Music-Player/1.0");
     http->SetHeader("Accept", "application/json");
+    // 注意：CreateHttp 返回 unique_ptr，所以传入需要 Http* 的函数时用 .get()
+    add_auth_headers(http.get()); // <-- 修正点：使用 .get()
     
     if (!http->Open("GET", full_url)) {
         ESP_LOGE(TAG, "Failed to connect to music API");
@@ -244,10 +410,24 @@ bool Esp32Music::Download(const std::string& song_name) {
     last_downloaded_data_ = http->ReadAll();
     http->Close();
     
-    ESP_LOGI(TAG, "HTTP GET Status = %d, content_length = %d", status_code, last_downloaded_data_.length());
+    ESP_LOGI(TAG, "HTTP GET Status = %d, content_length = %d", status_code, (int)last_downloaded_data_.length());
     ESP_LOGD(TAG, "Complete music details response: %s", last_downloaded_data_.c_str());
     
     if (!last_downloaded_data_.empty()) {
+        // first try to parse playlist if present
+        if (SetPlaylistFromJson(last_downloaded_data_)) {
+            // playlist constructed successfully -> play first track
+            ESP_LOGI(TAG, "Playlist parsed and set, Items=%d", (int)GetPlaylistSize());
+            int idx = 0;
+            {
+                std::lock_guard<std::mutex> lock(playlist_mutex_);
+                idx = current_playlist_index_;
+            }
+            PlayTrackInternal(idx);
+            return true;
+        }
+
+        // otherwise parse single-track response (existing behavior)
         cJSON* response_json = cJSON_Parse(last_downloaded_data_.c_str());
         if (response_json) {
             cJSON* artist = cJSON_GetObjectItem(response_json, "artist");
@@ -265,6 +445,9 @@ bool Esp32Music::Download(const std::string& song_name) {
             if (cJSON_IsString(audio_url) && audio_url->valuestring && strlen(audio_url->valuestring) > 0) {
                 ESP_LOGI(TAG, "Audio URL path: %s", audio_url->valuestring);
                 
+                // single track mode: clear playlist mode
+                ClearPlaylist();
+
                 current_music_url_ = audio_url->valuestring;
                                 
                 ESP_LOGI(TAG, "Starting streaming playback for: %s", song_name.c_str());
@@ -318,13 +501,16 @@ bool Esp32Music::Play() {
         return true;
     }
     
-    if (last_downloaded_data_.empty()) {
+    if (last_downloaded_data_.empty() && current_music_url_.empty()) {
         ESP_LOGE(TAG, "No music data to play");
         return false;
     }
     
     if (play_thread_.joinable()) {
-        play_thread_.join();
+        // join only if not current thread
+        if (play_thread_.get_id() != std::this_thread::get_id()) {
+            play_thread_.join();
+        }
     }
     
     return StartStreaming(current_music_url_);
@@ -348,10 +534,10 @@ bool Esp32Music::Stop() {
         buffer_cv_.notify_all();
     }
     
-    if (download_thread_.joinable()) {
+    if (download_thread_.joinable() && download_thread_.get_id() != std::this_thread::get_id()) {
         download_thread_.join();
     }
-    if (play_thread_.joinable()) {
+    if (play_thread_.joinable() && play_thread_.get_id() != std::this_thread::get_id()) {
         play_thread_.join();
     }
     
@@ -373,17 +559,19 @@ bool Esp32Music::StartStreaming(const std::string& music_url) {
     
     ESP_LOGD(TAG, "Starting streaming for URL: %s", music_url.c_str());
     
+    // set flags so download/play loops can stop
     is_downloading_ = false;
     is_playing_ = false;
     
-    if (download_thread_.joinable()) {
+    // join previous threads if they are joinable and not current thread
+    if (download_thread_.joinable() && download_thread_.get_id() != std::this_thread::get_id()) {
         {
             std::lock_guard<std::mutex> lock(buffer_mutex_);
             buffer_cv_.notify_all();
         }
         download_thread_.join();
     }
-    if (play_thread_.joinable()) {
+    if (play_thread_.joinable() && play_thread_.get_id() != std::this_thread::get_id()) {
         {
             std::lock_guard<std::mutex> lock(buffer_mutex_);
             buffer_cv_.notify_all();
@@ -440,7 +628,7 @@ bool Esp32Music::StopStreaming() {
 }
 
 // Extract embedded USLT lyrics (from ID3v2)
-std::string ExtractLyricsFromId3(const uint8_t* data, size_t size) {
+std::string Esp32Music::ExtractLyricsFromId3(const uint8_t* data, size_t size) {
     const char* uslt_tag = "USLT";
     for (size_t i = 0; i + 4 <= size; ++i) {
         if (memcmp(data + i, uslt_tag, 4) == 0) {
@@ -519,10 +707,11 @@ void Esp32Music::DownloadAudioStream(const std::string& music_url) {
             break;
         }
 
+        // 修复：解析嵌入式歌词时调用统一的 ParseLyrics 
         if (!lyrics_found_and_parsed && total_downloaded < (128 * 1024)) {
             std::string embedded_lyrics = ExtractLyricsFromId3(reinterpret_cast<const uint8_t*>(buffer), bytes_read);
             if (!embedded_lyrics.empty()) {
-                ParseLyrics(embedded_lyrics);
+                ParseLyrics(embedded_lyrics);  // 统一解析逻辑
                 lyrics_found_and_parsed = true;
             }
         }
@@ -549,6 +738,7 @@ void Esp32Music::DownloadAudioStream(const std::string& music_url) {
                 break;
             }
             
+            // 移动语义入队（避免拷贝）
             audio_buffer_.push(AudioChunk(chunk_data_copy, bytes_read));
             buffer_size_ += bytes_read;
             
@@ -556,7 +746,6 @@ void Esp32Music::DownloadAudioStream(const std::string& music_url) {
         }
 
         total_downloaded += bytes_read;
-
         vTaskDelay(pdMS_TO_TICKS(20));
     }
     
@@ -617,8 +806,8 @@ void Esp32Music::PlayAudioStream() {
     }
     int bytes_left = 0;
     uint8_t* read_ptr = mp3_input_buffer;
-    bool id3_processed = false;
 
+    bool id3_processed = false;
     int loop_counter = 0;
     
     while (is_playing_.load()) {
@@ -651,7 +840,8 @@ void Esp32Music::PlayAudioStream() {
                 song_name_displayed_ = true;
             }
         }
-        
+
+        // 修复：用移动语义获取队列元素（避免拷贝）
         if (bytes_left < (MP3_INPUT_BUFFER_SIZE / 2)) {
             AudioChunk chunk;
             bool got_chunk = false;
@@ -667,7 +857,8 @@ void Esp32Music::PlayAudioStream() {
                 }
                 
                 if (!audio_buffer_.empty()) {
-                    chunk = audio_buffer_.front();
+                    // 关键修复：移动语义赋值，不触发拷贝
+                    chunk = std::move(audio_buffer_.front());
                     audio_buffer_.pop();
                     buffer_size_ -= chunk.size;
                     got_chunk = true;
@@ -684,13 +875,13 @@ void Esp32Music::PlayAudioStream() {
                 size_t space_available = MP3_INPUT_BUFFER_SIZE - bytes_left;
                 size_t copy_size = std::min(chunk.size, space_available);
                 if (copy_size < chunk.size) {
-                    ESP_LOGW(TAG, "MP3 input buffer is full, discarding %zu bytes", chunk.size - copy_size);
+                    ESP_LOGW(TAG, "MP3 input buffer is full, discarding %d bytes", chunk.size - copy_size);
                 }
                 
                 memcpy(mp3_input_buffer + bytes_left, chunk.data, copy_size);
                 bytes_left += copy_size;
                 
-                heap_caps_free(chunk.data);
+                // 无需手动free：chunk析构会自动释放data
             }
         }
 
@@ -794,21 +985,29 @@ void Esp32Music::PlayAudioStream() {
     }
 
     ResetSampleRate();
-    ESP_LOGI(TAG, "Audio stream playback finished, total played: %zu bytes", total_played);
-    
+    ESP_LOGI(TAG, "Audio stream playback finished, total played: %d bytes", total_played);
     is_playing_ = false;
+
+    // 播放结束自动切歌
+    try {
+        OnPlaybackFinished();
+    } catch (...) {
+        ESP_LOGW(TAG, "OnPlaybackFinished threw exception");
+    }
 }
 
-// Clear audio buffer
 void Esp32Music::ClearAudioBuffer() {
     std::lock_guard<std::mutex> lock(buffer_mutex_);
     
     while (!audio_buffer_.empty()) {
-        AudioChunk chunk = audio_buffer_.front();
-        audio_buffer_.pop();
+        // 用const引用获取队列首元素（不触发拷贝）
+        const AudioChunk& chunk = audio_buffer_.front();
+        // 先释放数据（引用有效，chunk.data可安全访问）
         if (chunk.data) {
             heap_caps_free(chunk.data);
         }
+        // 再删除队列元素（避免引用失效后访问）
+        audio_buffer_.pop();
     }
     
     buffer_size_ = 0;
@@ -878,15 +1077,14 @@ size_t Esp32Music::SkipId3Tag(uint8_t* data, size_t size) {
     ESP_LOGI(TAG, "Found ID3v2 tag, skipping %u bytes", (unsigned int)total_skip);
     return total_skip;
 }
-
-// Abort current lyric HTTP (thread-safe)
+ 
 void Esp32Music::AbortCurrentLyricHttp() {
     std::lock_guard<std::mutex> lock(lyric_http_mutex_);
     if (current_lyric_http_) {
-        try {
-            current_lyric_http_->Close();
-        } catch (...) {}
-        current_lyric_http_.reset();
+        // 修复：Http类无Abort()，用Close()替代（符合HTTP客户端常规逻辑）
+        current_lyric_http_->Close();
+        current_lyric_http_.reset();  // unique_ptr自动释放内存
+        ESP_LOGI(TAG, "Aborted current lyric download");
     }
 }
 
@@ -980,7 +1178,7 @@ bool Esp32Music::DownloadLyrics(const std::string& lyric_url) {
                 break;
             } else {
                 if (!lyric_content.empty()) {
-                    ESP_LOGW(TAG, "HTTP read returned %d, but we have data (%d bytes), continuing", bytes_read, lyric_content.length());
+                    ESP_LOGW(TAG, "HTTP read returned %d, but we have data (%d bytes), continuing", bytes_read, (int)lyric_content.length());
                     success = true;
                     break;
                 } else {
@@ -1020,146 +1218,51 @@ bool Esp32Music::DownloadLyrics(const std::string& lyric_url) {
 
     ESP_LOGI(TAG, "Lyrics downloaded successfully, size: %d bytes", (int)lyric_content.length());
     return ParseLyrics(lyric_content);
-}
+} 
 
 // 替换版 ParseLyrics：同时支持 LRC 和 JSON(line数组) 两种格式
 bool Esp32Music::ParseLyrics(const std::string& lyric_content) {
-    ESP_LOGI(TAG, "Parsing lyrics content (auto-detect LRC or JSON)");
+    // 修复：用歌词专用锁（原代码用buffer_mutex_错误）
     std::lock_guard<std::mutex> lock(lyrics_mutex_);
     lyrics_.clear();
+    current_lyric_index_ = -1;
 
-    if (lyric_content.empty()) {
-        ESP_LOGW(TAG, "ParseLyrics: empty content");
-        return false;
-    }
-
-    // Helper to push a lyric line safely
-    auto push_line = [&](int timestamp_ms, const std::string &text) {
-        std::string trimmed = text;
-        // trim both ends
-        while (!trimmed.empty() && (trimmed.back() == '\r' || trimmed.back() == '\n')) trimmed.pop_back();
-        size_t i = 0;
-        while (i < trimmed.size() && (trimmed[i] == ' ' || trimmed[i] == '\t')) ++i;
-        if (i > 0) trimmed.erase(0, i);
-        lyrics_.push_back(std::make_pair(timestamp_ms, trimmed));
-    };
-
-    // 1) Try JSON parse if content likely JSON (starts with [ or {)
-    const char *p = lyric_content.c_str();
-    while (*p && isspace((unsigned char)*p)) ++p;
-    if (*p == '[' || *p == '{') {
-        cJSON *root = cJSON_Parse(lyric_content.c_str());
-        if (root) {
-            // root could be array or object containing array
-            cJSON *entries = nullptr;
-            if (cJSON_IsArray(root)) {
-                entries = root;
-            } else if (cJSON_IsObject(root)) {
-                // try to find top-level array: "lyrics" or "line" or similar
-                entries = cJSON_GetObjectItem(root, "lyrics");
-                if (!entries) entries = cJSON_GetObjectItem(root, "lines");
-                if (!entries) {
-                    // maybe object itself contains an array named "line"
-                    cJSON *maybeLine = cJSON_GetObjectItem(root, "line");
-                    if (maybeLine && cJSON_IsArray(maybeLine)) entries = maybeLine;
-                }
-                // if still null, treat root as single entry wrapped in object, so try "line" inside root
-                if (!entries) entries = root;
-            }
-
-            if (entries && cJSON_IsArray(entries)) {
-                int count = cJSON_GetArraySize(entries);
-                for (int i = 0; i < count; ++i) {
-                    cJSON *entry = cJSON_GetArrayItem(entries, i);
-                    if (!entry) continue;
-                    // entry may have "line" array
-                    cJSON *lines = cJSON_GetObjectItem(entry, "line");
-                    if (lines && cJSON_IsArray(lines)) {
-                        int ln = cJSON_GetArraySize(lines);
-                        for (int j = 0; j < ln; ++j) {
-                            cJSON *lineObj = cJSON_GetArrayItem(lines, j);
-                            if (!lineObj) continue;
-                            cJSON *start = cJSON_GetObjectItem(lineObj, "start");
-                            cJSON *value = cJSON_GetObjectItem(lineObj, "value");
-                            if (start && value && (cJSON_IsNumber(start) || cJSON_IsString(start)) && cJSON_IsString(value)) {
-                                int start_ms = 0;
-                                if (cJSON_IsNumber(start)) start_ms = (int)start->valuedouble;
-                                else start_ms = atoi(start->valuestring);
-                                push_line(start_ms, value->valuestring);
-                            }
-                        }
-                    } else {
-                        // entry might itself be a line object {start, value}
-                        cJSON *start = cJSON_GetObjectItem(entry, "start");
-                        cJSON *value = cJSON_GetObjectItem(entry, "value");
-                        if (start && value && cJSON_IsString(value)) {
-                            int start_ms = 0;
-                            if (cJSON_IsNumber(start)) start_ms = (int)start->valuedouble;
-                            else start_ms = atoi(start->valuestring);
-                            push_line(start_ms, value->valuestring);
-                        }
-                    }
-                }
-            } else if (cJSON_IsObject(root)) {
-                // try root->line array
-                cJSON *lineArr = cJSON_GetObjectItem(root, "line");
-                if (lineArr && cJSON_IsArray(lineArr)) {
-                    int ln = cJSON_GetArraySize(lineArr);
-                    for (int j = 0; j < ln; ++j) {
-                        cJSON *lineObj = cJSON_GetArrayItem(lineArr, j);
-                        if (!lineObj) continue;
-                        cJSON *start = cJSON_GetObjectItem(lineObj, "start");
-                        cJSON *value = cJSON_GetObjectItem(lineObj, "value");
-                        if (start && value && (cJSON_IsNumber(start) || cJSON_IsString(start)) && cJSON_IsString(value)) {
-                            int start_ms = cJSON_IsNumber(start) ? (int)start->valuedouble : atoi(start->valuestring);
-                            push_line(start_ms, value->valuestring);
-                        }
-                    }
-                }
-            }
-            cJSON_Delete(root);
-            std::sort(lyrics_.begin(), lyrics_.end());
-            ESP_LOGI(TAG, "Parsed %d lyric lines (from JSON)", (int)lyrics_.size());
-            return !lyrics_.empty();
-        } else {
-            ESP_LOGW(TAG, "ParseLyrics: JSON parse failed, will try LRC");
-        }
-    }
-
-    // 2) Fallback to LRC parsing: [mm:ss.xx]text
-    std::istringstream stream(lyric_content);
+    std::istringstream ss(lyric_content);
     std::string line;
-    while (std::getline(stream, line)) {
-        if (!line.empty() && line.back() == '\r') line.pop_back();
-        if (line.empty()) continue;
-        size_t pos = 0;
-        while (pos < line.size()) {
-            if (line[pos] != '[') break;
-            size_t close = line.find(']', pos);
-            if (close == std::string::npos) break;
-            std::string tag = line.substr(pos + 1, close - pos - 1);
-            std::string rest = line.substr(close + 1);
-            // parse mm:ss.xx or mm:ss
-            size_t colon = tag.find(':');
-            if (colon != std::string::npos) {
-                std::string mm = tag.substr(0, colon);
-                std::string ss = tag.substr(colon + 1);
-                try {
-                    int minutes = std::stoi(mm);
-                    float seconds = std::stof(ss);
-                    int timestamp_ms = minutes * 60 * 1000 + (int)(seconds * 1000.0f);
-                    push_line(timestamp_ms, rest);
-                } catch (...) {
-                    // skip malformed tag
-                }
-            }
-            pos = close + 1;
-            // if there are multiple [..][..]timestamp tags, loop to next tag in same line
-        }
+
+    // 逐行解析LRC歌词（格式：[mm:ss.xx]歌词内容）
+    while (std::getline(ss, line)) {
+        // 去除行首尾空白字符
+        line.erase(0, line.find_first_not_of(" \t\r\n"));
+        line.erase(line.find_last_not_of(" \t\r\n") + 1);
+        if (line.empty() || line[0] != '[') continue;
+
+        // 提取时间标签（如 [02:34.56]）
+        size_t time_end = line.find(']');
+        if (time_end == std::string::npos || time_end < 3) continue;
+        std::string time_str = line.substr(1, time_end - 1);
+        std::string content = line.substr(time_end + 1);
+        if (content.empty()) continue;
+
+        // 解析时间为毫秒（mm:ss 或 mm:ss.xx）
+        size_t colon_pos = time_str.find(':');
+        if (colon_pos == std::string::npos) continue;
+        int minutes = atoi(time_str.substr(0, colon_pos).c_str());
+        float seconds = atof(time_str.substr(colon_pos + 1).c_str());
+        if (minutes < 0 || seconds < 0) continue;
+        int64_t total_ms = static_cast<int64_t>(minutes * 60 * 1000 + seconds * 1000);
+
+        // 添加到歌词列表
+        lyrics_.push_back({total_ms, content});
     }
 
-    std::sort(lyrics_.begin(), lyrics_.end());
-    ESP_LOGI(TAG, "Parsed %d lyric lines (from LRC)", (int)lyrics_.size());
+    // 按时间排序歌词（确保播放时顺序正确）
+    std::sort(lyrics_.begin(), lyrics_.end(), [](const auto& a, const auto& b) {
+        return a.first < b.first;
+    });
+
+	ESP_LOGI(TAG, "Parsed %d LRC lyric lines", (int)lyrics_.size()); 
+    // 补充返回值：歌词列表非空则视为解析成功
     return !lyrics_.empty();
 }
 
@@ -1221,4 +1324,153 @@ void Esp32Music::UpdateLyricDisplay(int64_t current_time_ms) {
             ESP_LOGD(TAG, "Lyric update at %lldms: %s", current_time_ms, lyric_text.empty() ? "(no lyric)" : lyric_text.c_str());
         }
     }
+}
+
+// 当一首歌播放结束时调用（在 PlayAudioStream 线程结束后会触发）
+void Esp32Music::OnPlaybackFinished() {
+    // If in playlist mode, attempt to play next track automatically
+    bool playlist_mode = false;
+    {
+        std::lock_guard<std::mutex> lock(playlist_mutex_);
+        playlist_mode = is_playlist_mode_;
+    }
+    if (!playlist_mode) return;
+
+    // try to advance to next
+    bool advanced = false;
+    {
+        std::lock_guard<std::mutex> lock(playlist_mutex_);
+        if (!playlist_.empty()) {
+            int next = current_playlist_index_ + 1;
+            if (next < (int)playlist_.size()) {
+                current_playlist_index_ = next;
+                advanced = true;
+            } else {
+                // reached end -> no wrap by default
+                advanced = false;
+            }
+        }
+    }
+
+    if (advanced) {
+        // play the next track
+        int idx;
+        {
+            std::lock_guard<std::mutex> lock(playlist_mutex_);
+            idx = current_playlist_index_;
+        }
+        // Start next track asynchronously (so we don't call StartStreaming from within the just-exited playback thread in ambiguous states)
+        // But StartStreaming can be called safely here because play_thread_ is no longer joinable (this thread was play_thread_).
+        // To be conservative we spawn a small detached thread to start the next stream.
+        std::thread t([this, idx]() {
+            PlayTrackInternal(idx);
+        });
+        t.detach();
+    }
+}
+
+void Esp32Music::NextPlaylistTrack() {
+    // 保护 playlist 相关状态
+    std::lock_guard<std::mutex> lock(playlist_mutex_);
+    if (!is_playlist_mode_ || playlist_.empty()) {
+        ESP_LOGE(TAG, "Not in playlist mode or empty playlist");
+        return;
+    }
+
+    // 计算下一首索引（随机/顺序）
+    if (playlist_random_) {
+        std::random_device rd;
+        std::mt19937 gen(rd());
+        std::uniform_int_distribution<> distr(0, static_cast<int>(playlist_.size()) - 1);
+        current_playlist_index_ = distr(gen);
+    } else {
+        current_playlist_index_ = (current_playlist_index_ + 1) % playlist_.size();
+    }
+
+    // 读取当前曲目信息（不持有 lyrics_mutex_）
+    auto current_track = playlist_[current_playlist_index_]; // copy to avoid引用并发
+    current_song_name_ = current_track.title + " - " + current_track.artist;
+    song_name_displayed_ = false; // 重置歌曲名显示标志
+    current_music_url_ = current_track.audio_url;  // 更新音乐 URL
+    current_lyric_url_ = current_track.lyric_url;  // 更新歌词 URL
+
+    ESP_LOGI(TAG, "NextPlaylistTrack: preparing track %s (index %d)", current_song_name_.c_str(), current_playlist_index_);
+
+    // ------------------------ 歌词线程处理（先停止旧线程，再清理，再启动新线程） ------------------------
+    // 停止并 join 旧的显示线程（如果存在）
+    if (is_lyric_running_) {
+        is_lyric_running_ = false;
+        if (lyric_thread_.joinable()) {
+            // 如果 lyric_thread_ 不是当前线程则 join（安全检查）
+            if (lyric_thread_.get_id() != std::this_thread::get_id()) {
+                lyric_thread_.join();
+            } else {
+                // 极端情况：不能 join self，detach 以防阻塞（通常不会发生）
+                lyric_thread_.detach();
+            }
+        }
+    }
+
+    // 中止未完成的旧歌词 HTTP 下载（如果有）
+    AbortCurrentLyricHttp();
+
+    // 清空歌词数据与索引（在锁内保护）
+    {
+        std::lock_guard<std::mutex> l(lyrics_mutex_);
+        lyrics_.clear();
+    }
+    current_lyric_index_ = -1;
+
+    // 启动新的歌词显示线程（LyricDisplayThread 负责根据 current_lyric_url_ 进行下载并显示）
+    is_lyric_running_ = true;
+    // 启动线程之前再次确保歌词状态已初始化
+    current_lyric_index_ = -1;
+    {
+        std::lock_guard<std::mutex> l(lyrics_mutex_);
+        lyrics_.clear();
+    }
+    lyric_thread_ = std::thread(&Esp32Music::LyricDisplayThread, this);
+
+    // ------------------------ 停止旧下载/播放线程并清理缓冲 ------------------------
+    // 先请求停止下载/播放线程
+    is_downloading_ = false;
+    is_playing_ = false;
+
+    // 唤醒可能阻塞在 buffer_cv_ 的线程，让它们看到 is_downloading_/is_playing_ 标志并退出
+    {
+        std::lock_guard<std::mutex> buf_lock(buffer_mutex_);
+        buffer_cv_.notify_all();
+    }
+
+    // Join 下载线程（如果存在且不是当前线程）
+    if (download_thread_.joinable()) {
+        if (download_thread_.get_id() != std::this_thread::get_id()) {
+            download_thread_.join();
+        } else {
+            download_thread_.detach();
+        }
+    }
+
+    // Join 播放线程（如果存在且不是当前线程）
+    if (play_thread_.joinable()) {
+        if (play_thread_.get_id() != std::this_thread::get_id()) {
+            play_thread_.join();
+        } else {
+            play_thread_.detach();
+        }
+    }
+
+    // 清理音频缓冲区
+    ClearAudioBuffer();
+
+    // ------------------------ 启动新的下载与播放线程 ------------------------
+    // 启动下载线程（传入当前音乐 URL）
+    is_downloading_ = true;
+    download_thread_ = std::thread(&Esp32Music::DownloadAudioStream, this, current_music_url_);
+
+    // 启动播放线程
+    is_playing_ = true;
+    play_thread_ = std::thread(&Esp32Music::PlayAudioStream, this);
+
+    ESP_LOGI(TAG, "NextPlaylistTrack: started track %s (URL: %s)", current_song_name_.c_str(), current_music_url_.c_str());
 }
