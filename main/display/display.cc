@@ -169,6 +169,45 @@ void Display::UpdateStatusBar(bool update_all) {
         }
     }
 
+    // ---- 播放队列状态显示（右上角，格式: cur/total） ----
+    // 懒创建 playpos_label_（如果不存在）
+    {
+        DisplayLockGuard lock(this);
+        if (playpos_label_ == nullptr) {
+            playpos_label_ = lv_label_create(lv_scr_act());
+            // 使用默认字体，小字号；右对齐并稍作左移（留出时间显示空间）
+            lv_obj_align(playpos_label_, LV_ALIGN_TOP_RIGHT, -6, 0);
+            lv_obj_add_flag(playpos_label_, LV_OBJ_FLAG_HIDDEN); // 默认隐藏
+        }
+    }
+
+    // 获取播放位置（由 Application 提供接口），格式化并显示
+    try {
+        auto pos = Application::GetInstance().GetPlaybackPosition(); // {1-based cur, total}
+        const int cur = pos.first;
+        const int total = pos.second;
+
+        DisplayLockGuard lock(this);
+        if (playpos_label_ != nullptr) {
+            if (total > 0 && cur > 0) {
+                char buf[32];
+                snprintf(buf, sizeof(buf), "%d/%d", cur, total);
+                lv_label_set_text(playpos_label_, buf);
+                lv_obj_clear_flag(playpos_label_, LV_OBJ_FLAG_HIDDEN);
+                // 再次对齐，防止界面布局变化导致偏移
+                lv_obj_align(playpos_label_, LV_ALIGN_TOP_RIGHT, -6, 0);
+            } else {
+                // 没有播放信息时隐藏该标签
+                lv_obj_add_flag(playpos_label_, LV_OBJ_FLAG_HIDDEN);
+            }
+        }
+    } catch (...) {
+        DisplayLockGuard lock(this);
+        if (playpos_label_ != nullptr) {
+            lv_obj_add_flag(playpos_label_, LV_OBJ_FLAG_HIDDEN);
+        }
+    }
+
     // 每 10 秒更新一次网络图标
     static int seconds_counter = 0;
     if (update_all || seconds_counter++ % 10 == 0) {
@@ -193,7 +232,6 @@ void Display::UpdateStatusBar(bool update_all) {
 
     esp_pm_lock_release(pm_lock_);
 }
-
 
 void Display::SetEmotion(const char* emotion) {
     struct Emotion {

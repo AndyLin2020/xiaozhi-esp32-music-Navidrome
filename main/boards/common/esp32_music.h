@@ -88,6 +88,12 @@ public:
     bool SetPlaylistFromJson(const std::string& json);  // 从JSON构建播放列表
     void NextPlaylistTrack();          // 播放列表下一首（已声明，解决未定义错误）
 
+	// 返回当前播放的 playlist index（0-based）。若没有播放/队列为空，返回 -1
+	int GetCurrentPlaylistIndex() const;
+
+	// 单例访问（如果你愿意使用单例方式）；可选：如果你已有其它获取实例方法则不必添加
+	static Esp32Music& GetInstance();
+	
     // 播放列表轨道结构体
     struct PlaylistTrack {
         std::string id;

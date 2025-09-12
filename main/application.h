@@ -63,7 +63,9 @@ public:
     void AddAudioData(AudioStreamPacket&& packet);
     void PlaySound(const std::string_view& sound);
     AudioService& GetAudioService() { return audio_service_; }
-
+	// 如果没有播放或无队列，返回 {0, 0}
+	std::pair<int,int> GetPlaybackPosition();
+	
 private:
     Application();
     ~Application();

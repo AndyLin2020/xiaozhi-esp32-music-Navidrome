@@ -12,7 +12,7 @@
 struct DisplayFonts {
     const lv_font_t* text_font = nullptr;
     const lv_font_t* icon_font = nullptr;
-    const lv_font_t* emoji_font = nullptr;
+    const lv_font_t* emoji_font = nullptr;	
 };
 
 class Display {
@@ -53,6 +53,8 @@ protected:
     lv_obj_t* low_battery_popup_ = nullptr;
     lv_obj_t* low_battery_label_ = nullptr;
     
+	lv_obj_t* playpos_label_ = nullptr; // 新增：播放位置标签（右上角）
+	
     const char* battery_icon_ = nullptr;
     const char* network_icon_ = nullptr;
     bool muted_ = false;

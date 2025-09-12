@@ -8,6 +8,7 @@
 #include "font_awesome_symbols.h"
 #include "assets/lang_config.h"
 #include "mcp_server.h"
+#include "esp32_music.h"
 
 #include <cstring>
 #include <esp_log.h>
@@ -854,4 +855,27 @@ void Application::AddAudioData(AudioStreamPacket&& packet) {
 
 void Application::PlaySound(const std::string_view& sound) {
     audio_service_.PlaySound(sound);
+}
+
+// -----------------------------------------------------------------------------
+// 新增：Playback position helper - 返回 {currentIndex (1-based), totalCount}
+// 若无播放或无队列，返回 {0,0}
+// -----------------------------------------------------------------------------
+std::pair<int,int> Application::GetPlaybackPosition() {
+    try {
+        // 这里假定 Esp32Music 提供一个全局或单例访问接口 GetInstance()
+        // 并提供 GetPlaylistSize() 与 GetCurrentPlaylistIndex() 的 const getter。
+        // 如果你的 Esp32Music 实例是通过其他对象访问（例如 Board::GetInstance().GetMusic()），
+        // 将下面两行替换为你工程中实际获取 music 对象的方式即可。
+        auto &music = Esp32Music::GetInstance();
+        size_t total = music.GetPlaylistSize();
+        int idx0 = music.GetCurrentPlaylistIndex(); // 0-based index；若未开始返回 -1
+
+        if (total == 0) return {0, 0};
+        if (idx0 < 0) return {0, static_cast<int>(total)};
+        return { idx0 + 1, static_cast<int>(total) };
+    } catch (...) {
+        // 安全返回，避免 UI 因异常崩溃
+        return {0, 0};
+    }
 }

@@ -22,6 +22,7 @@
 #include <freertos/task.h>
 
 #define TAG "Esp32Music"
+static Esp32Music* g_esp32_music_instance = nullptr;
 
 // forward declare Http class type (implementation provided by board/network)
 class Http;
@@ -78,6 +79,8 @@ Esp32Music::Esp32Music() : last_downloaded_data_(), current_music_url_(), curren
                          mp3_decoder_initialized_(false),
                          playlist_mutex_(), playlist_(), current_playlist_index_(0), is_playlist_mode_(false),
                          playlist_random_(false), playlist_type_() {
+	// 将实例指针指向 this（便于全局访问）
+    g_esp32_music_instance = this;
     ESP_LOGI(TAG, "Music player initialized");
     InitializeMp3Decoder();
 }
@@ -166,10 +169,28 @@ Esp32Music::~Esp32Music() {
     // clear playlist
     ClearPlaylist();
     
+	// ... 原有清理逻辑 ...
+    g_esp32_music_instance = nullptr;
     ESP_LOGI(TAG, "Music player destroyed successfully");
 }
 
 // ---------- Playlist helpers ----------
+int Esp32Music::GetCurrentPlaylistIndex() const {
+    std::lock_guard<std::mutex> lock(playlist_mutex_);
+    if (playlist_.empty()) return -1;
+    return current_playlist_index_;
+}
+
+Esp32Music& Esp32Music::GetInstance() {
+    if (!g_esp32_music_instance) {
+        // 如果尚未初始化，抛异常或断言（Application 会捕获异常并安全返回）
+        // 这里使用 abort 是最简单直接的方法，也可改为抛异常
+        ESP_LOGE(TAG, "Esp32Music::GetInstance() called before instance constructed!");
+        abort();
+    }
+    return *g_esp32_music_instance;
+}
+
 size_t Esp32Music::GetPlaylistSize() const {
     std::lock_guard<std::mutex> lock(playlist_mutex_);
     return playlist_.size();
