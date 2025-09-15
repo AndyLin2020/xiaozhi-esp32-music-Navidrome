@@ -774,5 +774,7 @@ bool HttpClient::IsDataComplete() const {
         return total_body_received_ >= content_length_;
     }
 
+    // 如果没有content-length且不是chunked，当连接关闭时认为完整
+    // 这种情况通常用于HTTP/1.0或者content-length为0的响应
     return true;
 }

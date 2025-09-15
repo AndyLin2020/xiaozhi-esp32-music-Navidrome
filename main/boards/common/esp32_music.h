@@ -51,10 +51,10 @@ struct AudioChunk {
 
     // 析构函数（避免内存泄漏）
     ~AudioChunk() {
-        //if (data) {
-        //    heap_caps_free(data);
-        //    data = nullptr;
-        //}
+        if (data) {
+            heap_caps_free(data);
+            data = nullptr;
+        }
     }
 };
 

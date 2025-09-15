@@ -1495,6 +1495,22 @@ void Esp32Music::OnPlaybackFinished() {
             PlayTrackInternal(idx);
         });
         t.detach();
+    } else {
+        // [BUG修复] 处理播放列表播放结束的情况
+        ESP_LOGI(TAG, "Playlist finished. Cleaning up state.");
+        
+        // 获取显示设备
+        auto& board = Board::GetInstance();
+        auto display = board.GetDisplay();
+        if (display) {
+            // 设置一个提示信息，并清空播放列表状态
+            display->SetMusicInfo("播放列表已结束");
+            // 假设您有一个可以清空播放列表状态的显示函数，如果没有，此行可省略或修改
+            // 比如 display->SetPlaylistStatus("", 0, 0); 
+        }
+
+        // 清空内部播放列表数据
+        ClearPlaylist();
     }
 }
 
