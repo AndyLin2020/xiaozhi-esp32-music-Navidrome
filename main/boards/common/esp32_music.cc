@@ -884,16 +884,31 @@ void Esp32Music::PlayAudioStream() {
         auto& app = Application::GetInstance();
         DeviceState current_state = app.GetDeviceState();
         
-        if (current_state == kDeviceStateListening) {
-            ESP_LOGI(TAG, "Device is in listening state, switching to idle state for music playback");
+        // 检查设备是否处于需要进行状态转换以允许音乐播放的状态
+        if (current_state == kDeviceStateSpeaking || current_state == kDeviceStateListening) {
+            if (current_state == kDeviceStateSpeaking) {
+                ESP_LOGI(TAG, "Device is in speaking state, switching to listening state for music playback");
+                // 此时可能需要执行一些操作来结束说话状态，并进入聆听或准备进入空闲
+                // app.ToggleChatState() 通常用于在聊天模式和非聊天模式之间切换，
+                // 如果 speaking/listening 是聊天模式，调用它会尝试退出聊天模式。
+            } else { // current_state == kDeviceStateListening
+                ESP_LOGI(TAG, "Device is in listening state, switching to idle state for music playback");
+                // 此时需要结束聆听状态，通常会进入空闲状态
+            }
+            // 无论是说话还是聆听，我们都希望通过ToggleChatState()来退出当前的交互模式，
+            // 从而向Idle状态过渡，为音乐播放做准备。
             app.ToggleChatState();
-            vTaskDelay(pdMS_TO_TICKS(300));
-            continue;
-        } else if (current_state != kDeviceStateIdle) {
-            ESP_LOGD(TAG, "Device state is %d, pausing music playback", current_state);
-            vTaskDelay(pdMS_TO_TICKS(100));
-            continue;
+            vTaskDelay(pdMS_TO_TICKS(300)); // 给予状态转换一些时间
+            continue; // 继续下一个循环迭代，等待状态真正变为Idle
         }
+        // 如果设备处于其他非Idle状态（但不是Speaking或Listening），则暂停音乐
+        else if (current_state != kDeviceStateIdle) {
+            ESP_LOGD(TAG, "Device state is %d, pausing music playback", current_state);
+            vTaskDelay(pdMS_TO_TICKS(100)); // 短暂延迟
+            continue; // 继续下一个循环迭代
+        }
+        // 如果 current_state == kDeviceStateIdle，代码会跳过以上所有if/else if，
+        // 继续执行后续的音乐播放逻辑。
         
         if (!song_name_displayed_ && !current_song_name_.empty()) {
             auto& board = Board::GetInstance();
