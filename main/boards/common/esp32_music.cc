@@ -1081,11 +1081,11 @@ void Esp32Music::ClearAudioBuffer() {
     
     while (!audio_buffer_.empty()) {
         // 用const引用获取队列首元素（不触发拷贝）
-        const AudioChunk& chunk = audio_buffer_.front();
+        //const AudioChunk& chunk = audio_buffer_.front();
         // 先释放数据（引用有效，chunk.data可安全访问）
-        if (chunk.data) {
-            heap_caps_free(chunk.data);
-        }
+        //if (chunk.data) {
+        //    heap_caps_free(chunk.data);
+        //}
         // 再删除队列元素（避免引用失效后访问）
         audio_buffer_.pop();
     }
