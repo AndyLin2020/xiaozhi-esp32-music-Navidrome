@@ -20,7 +20,8 @@ struct WifiApRecord {
 class WifiStation {
 public:
     static WifiStation& GetInstance();
-    void AddAuth(const std::string &&ssid, const std::string &&password);
+    //void AddAuth(const std::string &&ssid, const std::string &&password);
+	void AddAuth(const std::string& ssid, const std::string& password);
     void Start();
     void Stop();
     bool IsConnected();
