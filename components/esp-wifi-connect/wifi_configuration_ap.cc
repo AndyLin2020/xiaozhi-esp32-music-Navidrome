@@ -372,6 +372,9 @@ void WifiConfigurationAp::StartWebServer()
 
             // 获取当前对象
             auto *this_ = static_cast<WifiConfigurationAp *>(req->user_ctx);
+			// 先保存（保证用户输入不会丢失）
+			this_->Save(ssid_str, password_str);
+			
             if (!this_->ConnectToWifi(ssid_str, password_str)) {
                 cJSON_Delete(json);
                 httpd_resp_send(req, "{\"success\":false,\"error\":\"无法连接到 WiFi\"}", HTTPD_RESP_USE_STRLEN);
