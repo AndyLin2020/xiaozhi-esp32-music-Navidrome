@@ -133,8 +133,8 @@ private:
     std::mutex buffer_mutex_;
     std::condition_variable buffer_cv_;
     size_t buffer_size_;
-    static constexpr size_t MAX_BUFFER_SIZE = 128 * 1024;  // 256KB 最大缓冲区
-    static constexpr size_t MIN_BUFFER_SIZE = 16 * 1024;   // 32KB 最小播放缓冲区
+    static constexpr size_t MAX_BUFFER_SIZE = 256 * 1024;  // 256KB 最大缓冲区
+    static constexpr size_t MIN_BUFFER_SIZE = 32 * 1024;   // 32KB 最小播放缓冲区
 
     // MP3解码器
     HMP3Decoder mp3_decoder_;

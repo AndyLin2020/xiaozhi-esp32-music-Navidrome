@@ -4,6 +4,7 @@
 #include <string>
 #include <vector>
 #include <functional>
+#include <atomic>
 
 #include <esp_event.h>
 #include <esp_timer.h>
@@ -61,6 +62,9 @@ private:
     void StartConnect();
     static void WifiEventHandler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data);
     static void IpEventHandler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data);
+	
+	std::atomic<bool> connecting_{false}; // 表示是否正在进行连接请求（避免并发调用 esp_wifi_connect）
+
 };
 
 #endif // _WIFI_STATION_H_

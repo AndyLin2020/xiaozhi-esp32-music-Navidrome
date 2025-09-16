@@ -283,6 +283,11 @@ void WifiStation::StartConnect() {
         return;
     }
 
+    if (connecting_.load()) {
+        ESP_LOGI(TAG, "StartConnect: already connecting, skipping");
+        return;
+    }
+
     auto ap_record = connect_queue_.front();
     connect_queue_.erase(connect_queue_.begin());
 
@@ -317,9 +322,13 @@ void WifiStation::StartConnect() {
         wifi_config.sta.bssid_set = false;
     }
 
+    // 标记正在连接，避免并发
+    connecting_.store(true);
+
     esp_err_t rc = esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
     if (rc != ESP_OK) {
         ESP_LOGE(TAG, "esp_wifi_set_config failed: %s", esp_err_to_name(rc));
+        connecting_.store(false); // 清理
         esp_timer_start_once(timer_handle_, 5000);
         return;
     }
@@ -328,9 +337,11 @@ void WifiStation::StartConnect() {
     rc = esp_wifi_connect();
     if (rc != ESP_OK) {
         ESP_LOGW(TAG, "esp_wifi_connect failed: %s", esp_err_to_name(rc));
+        connecting_.store(false); // 清理
         esp_timer_start_once(timer_handle_, 5000);
     } else {
         ESP_LOGI(TAG, "Attempting connect to SSID: %s", ssid_.c_str());
+        // keep connecting_ == true 直到连接成功或断开事件清理
     }
 }
 
@@ -364,45 +375,104 @@ void WifiStation::SetPowerSaveMode(bool enabled) {
 
 void WifiStation::WifiEventHandler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data) {
     auto* this_ = static_cast<WifiStation*>(arg);
-    if (event_id == WIFI_EVENT_STA_START) {
-        // [BUG修复] 修改扫描配置以发现隐藏网络
-        wifi_scan_config_t scan_config = {
-            .ssid = NULL,       // Scan for all SSIDs
-            .bssid = NULL,
-            .channel = 0,
-            .show_hidden = true, 
-            .scan_type = WIFI_SCAN_TYPE_ACTIVE,
-            .scan_time = {
-                .active = {
-                    .min = 120, 
-                    .max = 300  // 增加最大扫描时间，提高发现隐藏网络的几率
+
+    // 只处理 WIFI_EVENT 基类的事件
+    if (event_base != WIFI_EVENT) return;
+
+    switch (event_id) {
+        case WIFI_EVENT_STA_START: {
+            ESP_LOGI(TAG, "WIFI_EVENT_STA_START: starting initial scan");
+            // 触发一次扫描（发现隐藏网络）
+            wifi_scan_config_t scan_config = {
+                .ssid = NULL,
+                .bssid = NULL,
+                .channel = 0,
+                .show_hidden = true,
+                .scan_type = WIFI_SCAN_TYPE_ACTIVE,
+                .scan_time = {
+                    .active = { .min = 120, .max = 300 }
+                }
+            };
+            esp_err_t rc = esp_wifi_scan_start(&scan_config, false);
+            if (rc != ESP_OK) {
+                ESP_LOGW(TAG, "esp_wifi_scan_start failed: %s", esp_err_to_name(rc));
+            }
+            if (this_->on_scan_begin_) this_->on_scan_begin_();
+            break;
+        }
+
+        case WIFI_EVENT_SCAN_DONE: {
+            ESP_LOGI(TAG, "WIFI_EVENT_SCAN_DONE");
+            // 处理扫描结果（你的函数内部会决定重试或发起连接）
+            this_->HandleScanResult();
+            break;
+        }
+
+        case WIFI_EVENT_STA_CONNECTED: {
+            // 驱动已建立链路（但未必获取到 IP）
+            ESP_LOGI(TAG, "WIFI_EVENT_STA_CONNECTED");
+            // 清除 connecting_ 标志，表示驱动已完成连接尝试
+            this_->connecting_.store(false);
+            // reset reconnect counter (we connected to AP)
+            this_->reconnect_count_ = 0;
+            break;
+        }
+
+        case WIFI_EVENT_STA_DISCONNECTED: {
+            // 获取断开原因（可选用于 debug）
+            wifi_event_sta_disconnected_t* dis = static_cast<wifi_event_sta_disconnected_t*>(event_data);
+            int reason = dis ? dis->reason : -1;
+            ESP_LOGW(TAG, "WIFI_EVENT_STA_DISCONNECTED, reason=%d", reason);
+
+            // 清掉连接标志位
+            xEventGroupClearBits(this_->event_group_, WIFI_EVENT_CONNECTED);
+            // 无论何时断开，都要把 connecting_ 清掉，允许后续重试
+            this_->connecting_.store(false);
+
+            // 如果还有重连次数，优先尝试驱动层 reconnect（但先确保不并发）
+            if (this_->reconnect_count_ < MAX_RECONNECT_COUNT) {
+                esp_err_t rc = ESP_OK;
+                if (!this_->connecting_.load()) {
+                    rc = esp_wifi_connect();
+                    if (rc == ESP_OK) {
+                        this_->connecting_.store(true);
+                        this_->reconnect_count_++;
+                        ESP_LOGI(TAG, "Reconnecting %s (attempt %d / %d)", this_->ssid_.c_str(), this_->reconnect_count_, MAX_RECONNECT_COUNT);
+                        break;
+                    } else {
+                        ESP_LOGW(TAG, "esp_wifi_connect failed in reconnect: %s", esp_err_to_name(rc));
+                    }
+                } else {
+                    ESP_LOGI(TAG, "Already connecting, skipping immediate reconnect");
                 }
             }
-        };
-        esp_wifi_scan_start(&scan_config, false);
 
-        if (this_->on_scan_begin_) {
-            this_->on_scan_begin_();
-        }
-    } else if (event_id == WIFI_EVENT_SCAN_DONE) {
-        this_->HandleScanResult();
-    } else if (event_id == WIFI_EVENT_STA_DISCONNECTED) {
-        xEventGroupClearBits(this_->event_group_, WIFI_EVENT_CONNECTED);
-        if (this_->reconnect_count_ < MAX_RECONNECT_COUNT) {
-            esp_wifi_connect();
-            this_->reconnect_count_++;
-            ESP_LOGI(TAG, "Reconnecting %s (attempt %d / %d)", this_->ssid_.c_str(), this_->reconnect_count_, MAX_RECONNECT_COUNT);
-            return;
+            // 如果连接队列里还有候选 AP，就用 StartConnect 发起下一候选的连接（但避免并发）
+            if (!this_->connect_queue_.empty()) {
+                if (!this_->connecting_.load()) {
+                    // 小延时以避免立刻冲突（给驱动一点缓冲时间）
+                    esp_timer_start_once(this_->timer_handle_, 300);
+                    // StartConnect 会有自己的 connecting_ 检查
+                    // 这里我们直接 schedule，StartConnect 将在 timer 回调触发时运行（如果你没有 timer 回调触发 StartConnect，则直接调用 StartConnect）
+                    // 为简单直接：调用 StartConnect，但加保护
+                    this_->StartConnect();
+                } else {
+                    ESP_LOGI(TAG, "connect_queue_ available but already connecting; will try later");
+                    esp_timer_start_once(this_->timer_handle_, 500);
+                }
+                break;
+            }
+
+            // 如果没有候选 AP，启动下次周期扫描
+            ESP_LOGI(TAG, "No more AP to connect, schedule next scan");
+            esp_timer_start_once(this_->timer_handle_, 10 * 1000);
+            break;
         }
 
-        if (!this_->connect_queue_.empty()) {
-            this_->StartConnect();
-            return;
+        default: {
+            // ignore other wifi events
+            break;
         }
-        
-        ESP_LOGI(TAG, "No more AP to connect, wait for next scan");
-        esp_timer_start_once(this_->timer_handle_, 10 * 1000);
-    } else if (event_id == WIFI_EVENT_STA_CONNECTED) {
     }
 }
 
