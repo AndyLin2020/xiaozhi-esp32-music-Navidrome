@@ -262,7 +262,7 @@ void HttpClient::OnTcpDisconnected() {
 
     if (headers_received_ && !IsDataComplete()) {
         connection_error_ = true;
-        ESP_LOGE(TAG, "Connection closed prematurely, expected %u bytes but only received %u bytes",
+        ESP_LOGE(TAG, "连接过早关闭，预期接收 %u 字节，但实际只接收到 %u 字节",
                  content_length_, total_body_received_);
     } else {
         eof_ = true;
@@ -608,7 +608,7 @@ int HttpClient::Read(char* buffer, size_t buffer_size) {
     });
 
     if (!received) {
-        ESP_LOGE(TAG, "Wait for HTTP content receive timeout");
+        ESP_LOGE(TAG, "等待HTTP内容接收超时");
         return -1;
     }
 

@@ -176,7 +176,7 @@ void Display::UpdateStatusBar(bool update_all) {
         if (playpos_label_ == nullptr) {
             playpos_label_ = lv_label_create(lv_scr_act());
             // 使用默认字体，小字号；右对齐并稍作左移（留出时间显示空间）
-            lv_obj_align(playpos_label_, LV_ALIGN_TOP_RIGHT, -6, 0);
+            lv_obj_align(playpos_label_, LV_ALIGN_TOP_RIGHT, -2, 0);
             lv_obj_add_flag(playpos_label_, LV_OBJ_FLAG_HIDDEN); // 默认隐藏
         }
     }
@@ -195,7 +195,7 @@ void Display::UpdateStatusBar(bool update_all) {
                 lv_label_set_text(playpos_label_, buf);
                 lv_obj_clear_flag(playpos_label_, LV_OBJ_FLAG_HIDDEN);
                 // 再次对齐，防止界面布局变化导致偏移
-                lv_obj_align(playpos_label_, LV_ALIGN_TOP_RIGHT, -6, 0);
+                lv_obj_align(playpos_label_, LV_ALIGN_TOP_RIGHT, -2, 0);
             } else {
                 // 没有播放信息时隐藏该标签
                 lv_obj_add_flag(playpos_label_, LV_OBJ_FLAG_HIDDEN);
