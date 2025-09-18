@@ -35,7 +35,7 @@ public:
 
     void OnConnect(std::function<void(const std::string& ssid)> on_connect);
     void OnConnected(std::function<void(const std::string& ssid)> on_connected);
-    void OnScanBegin(std::function<void()> on_scan_begin);
+    void OnScanBegin(std::function<void()> on_scan_begin); 
 
 private:
     WifiStation();

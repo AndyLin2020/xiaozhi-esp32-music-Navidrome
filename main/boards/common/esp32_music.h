@@ -184,6 +184,7 @@ private:
     bool PlayPrevInPlaylist();
     bool PlayTrackInternal(int index);
     void OnPlaybackFinished();      // 播放结束回调（自动切歌）
+	void checkAndRestorePowerSave();
 };
 
 #endif // ESP32_MUSIC_H
