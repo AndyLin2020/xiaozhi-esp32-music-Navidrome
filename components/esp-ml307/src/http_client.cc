@@ -262,8 +262,8 @@ void HttpClient::OnTcpDisconnected() {
 
     if (headers_received_ && !IsDataComplete()) {
         connection_error_ = true;
-        ESP_LOGE(TAG, "连接过早关闭，预期接收 %u 字节，但实际只接收到 %u 字节",
-                 content_length_, total_body_received_);
+        //ESP_LOGI(TAG, "连接过早关闭，预期接收 %u 字节，但实际只接收到 %u 字节",
+        //         content_length_, total_body_received_);
     } else {
         eof_ = true;
     }

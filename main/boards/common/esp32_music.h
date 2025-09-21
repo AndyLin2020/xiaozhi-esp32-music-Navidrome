@@ -185,6 +185,8 @@ private:
     bool PlayTrackInternal(int index);
     void OnPlaybackFinished();      // 播放结束回调（自动切歌）
 	void checkAndRestorePowerSave();
+	// 锁定当前流的采样率，防止VBR音频频繁重置硬件
+    bool current_stream_samplerate_locked_;
 };
 
 #endif // ESP32_MUSIC_H
