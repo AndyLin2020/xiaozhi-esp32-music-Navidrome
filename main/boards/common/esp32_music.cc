@@ -5,6 +5,7 @@
 #include "application.h"
 #include "protocols/protocol.h"
 #include "display/display.h"
+#include "assets/lang_config.h"
 
 #include <esp_log.h>
 #include <esp_heap_caps.h>
@@ -70,7 +71,7 @@ static std::string url_encode(const std::string& str) {
 Esp32Music::Esp32Music() : last_downloaded_data_(), current_music_url_(), current_song_name_(),
                          song_name_displayed_(false), current_lyric_url_(), lyrics_(), 
                          current_lyric_index_(-1), lyric_thread_(), is_lyric_running_(false),
-                         is_playing_(false), is_downloading_(false), 
+                         is_playing_(false), is_downloading_(false), force_stop_(false),
                          play_thread_(), download_thread_(), audio_buffer_(), buffer_mutex_(), 
                          buffer_cv_(), buffer_size_(0), mp3_decoder_(nullptr), mp3_frame_info_(), 
                          mp3_decoder_initialized_(false),
@@ -192,7 +193,6 @@ Esp32Music::~Esp32Music() {
     
     ClearPlaylist();
     
-	// ... 原有清理逻辑 ...
     g_esp32_music_instance = nullptr;
 	
 	// 停止 lyric worker
@@ -501,6 +501,10 @@ bool Esp32Music::Download(const std::string& song_name) {
     return PlayTrackInternal(idx_to_play);
 }
 
+bool Esp32Music::IsPlaying() const {
+    return is_playing_.load();
+}
+
 bool Esp32Music::Play() {
     if (is_playing_.load()) {
         ESP_LOGW(TAG, "音乐已在播放");
@@ -585,7 +589,8 @@ bool Esp32Music::StartStreaming(const std::string& music_url) {
     
     ClearAudioBuffer();
     current_stream_samplerate_locked_ = false;
-    
+    force_stop_ = false; // 重置停止标志
+	
     esp_pthread_cfg_t cfg;
     
     // 1. 配置下载线程
@@ -624,7 +629,7 @@ bool Esp32Music::StopStreaming() {
         ESP_LOGW(TAG, "当前没有正在进行的流媒体播放");
         return true;
     }
-    
+     
     is_downloading_ = false;
     is_playing_ = false;
     
@@ -1006,10 +1011,15 @@ playback_end:
     ESP_LOGI(TAG, "音频流播放完成，总共播放: %u 字节", (unsigned)total_played);
     is_playing_ = false;
 
-    try {
-        OnPlaybackFinished();
-    } catch (...) {
-        ESP_LOGW(TAG, "OnPlaybackFinished 抛出异常");
+    // 只有在不是被强制停止的情况下，才自动播放下一首
+    if (!force_stop_.load()) {
+        try {
+            OnPlaybackFinished();
+        } catch (...) {
+            ESP_LOGW(TAG, "OnPlaybackFinished 抛出异常");
+        }
+    } else {
+        ESP_LOGI(TAG, "播放被强制停止，不自动切换到下一首。");
     }
 }
 
@@ -1349,18 +1359,28 @@ void Esp32Music::OnPlaybackFinished() {
         //处理播放列表播放结束的情况
         ESP_LOGI(TAG, "播放列表完成。正在清理状态。");
         
-        // 获取显示设备
-        auto& board = Board::GetInstance();
-        auto display = board.GetDisplay();
-        if (display) {
-            // 设置一个提示信息，并清空播放列表状态
-            display->SetMusicInfo("播放列表已结束");
-            // 假设您有一个可以清空播放列表状态的显示函数，如果没有，此行可省略或修改
-            // 比如 display->SetPlaylistStatus("", 0, 0); 
-        }
+        std::thread([this]() {
+            auto& board = Board::GetInstance();
+            auto display = board.GetDisplay();
+            if (display) {
+                display->SetMusicInfo("播放列表已结束");
+            }
+
+            // 延时5秒
+            std::this_thread::sleep_for(std::chrono::seconds(5));
+
+            display = board.GetDisplay();
+            if (display) {
+                //splay->SetMusicInfo(""); 
+
+				display->SetStatus(Lang::Strings::STANDBY);
+				display->SetEmotion("neutral");
+				display->SetChatMessage("system", "");
+            }
 
         // 清空内部播放列表数据
         ClearPlaylist();
+		}).detach();
     }
 }
 
@@ -1472,4 +1492,11 @@ void Esp32Music::NextPlaylistTrack() {
     play_thread_ = std::thread(&Esp32Music::PlayAudioStream, this);
 
     ESP_LOGI(TAG, "NextPlaylistTrack: 开始播放曲目 %s (网址: %s)", current_song_name_.c_str(), current_music_url_.c_str());
+}
+
+void Esp32Music::ForceStopAndClear() {
+    ESP_LOGI(TAG, "收到强制停止指令 (来自长按)");
+    force_stop_ = true;
+    StopStreaming();
+    ClearPlaylist();
 }

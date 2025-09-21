@@ -926,116 +926,140 @@ function startHttpBridge() {
       return;
     } // end /stream_pcm
 
-// stream_proxy: 代理音频，并根据参数决定是否使用FFmpeg强制转码
-if (pathname === "/stream_proxy") {
-      const songId = parsed.query.songId;
-      if (!songId || !navidromeClient) {
-        res.writeHead(400, { "Content-Type": "application/json" }).end(JSON.stringify({ error: "missing songId or client not ready" }));
-        return;
-      }
+	// stream_proxy: 代理音频，并根据参数决定是否使用FFmpeg强制转码
+	if (pathname === "/stream_proxy") {
+		  const songId = parsed.query.songId;
+		  if (!songId || !navidromeClient) {
+			res.writeHead(400, { "Content-Type": "application/json" }).end(JSON.stringify({ error: "missing songId or client not ready" }));
+			return;
+		  }
 
-      const forceCbr = parsed.query.force_cbr === '1';
+		  const forceCbr = parsed.query.force_cbr === '1';
 
-      if (!forceCbr) {
-        // 非转码请求，使用旧的简单代理逻辑
-        logger.info(`[Proxy] Passthrough mode for songId=${songId}`);
-        const transcodeOptions = {};
-        for (const [k, v] of Object.entries(parsed.query || {})) {
-          if (k !== "songId" && k !== "force_cbr") transcodeOptions[k] = v;
-        }
-        const navidromeTranscodeUrl = navidromeClient.getStreamUrl(songId, transcodeOptions);
-        proxyRequestToUpstream(navidromeTranscodeUrl, req, res);
-        return;
-      }
-      
-      // [最终修复] 使用“立即响应+后台转码”模式处理强制转码请求
-      try {
-        logger.info(`[FFmpeg-Buffered] Starting buffered CBR transcode for songId=${songId}`);
+		  if (!forceCbr) {
+			// 非转码请求，逻辑保持不变
+			logger.info(`[Proxy] Passthrough mode for songId=${songId}`);
+			const transcodeOptions = {};
+			for (const [k, v] of Object.entries(parsed.query || {})) {
+			  if (k !== "songId" && k !== "force_cbr") transcodeOptions[k] = v;
+			}
+			const navidromeTranscodeUrl = navidromeClient.getStreamUrl(songId, transcodeOptions);
+			proxyRequestToUpstream(navidromeTranscodeUrl, req, res);
+			return;
+		  }
+		  
+		  try {
+			logger.info(`[FFmpeg-Buffered] Starting buffered CBR transcode for songId=${songId}`);
 
-        // 1. 立即响应客户端，保持连接活跃
-        res.writeHead(200, {
-          'Content-Type': 'audio/mpeg',
-          'Transfer-Encoding': 'chunked',
-          'Connection': 'keep-alive',
-          'Accept-Ranges': 'none'
-        });
+			res.writeHead(200, {
+			  'Content-Type': 'audio/mpeg',
+			  'Transfer-Encoding': 'chunked',
+			  'Connection': 'keep-alive',
+			  'Accept-Ranges': 'none'
+			});
 
-        // 2. 定义一个静音MP3帧 (192kbps, 44.1kHz, stereo, 1152 samples)
-        // 这是一个有效的、但完全是静音的MP3数据块
-        const silentFrame = Buffer.from('fffb10c4000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000' + '0'.repeat(242), 'hex');
-        
-        let sentRealData = false;
-        const sendSilentFrames = () => {
-          if (sentRealData || res.writableEnded) return;
-          res.write(silentFrame);
-          setTimeout(sendSilentFrames, 20); // 每20ms发送一次静音帧
-        };
-        sendSilentFrames(); // 开始发送静音帧
+			const silentFrame = Buffer.from('fffb10c400000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000- '.repeat(242), 'hex');
+			
+			let sentRealData = false;
+			const sendSilentFrames = () => {
+			  if (sentRealData || res.writableEnded) return;
+			  try {
+				res.write(silentFrame);
+			  } catch (e) {
+				logger.warn(`[FFmpeg-Buffered] Error writing silent frame (client likely disconnected): ${e.message}`);
+				return;
+			  }
+			  setTimeout(sendSilentFrames, 20);
+			};
+			sendSilentFrames();
 
-        // 3. 在后台启动FFmpeg转码
-		const ffmpegArgs = [
-		  '-hide_banner',
-		  '-i', 'pipe:0',
-		  '-map', '0:a:0',
-		  '-c:a', 'libmp3lame',
-		  '-ar', '44100',
-		  '-b:a', '192k',
-		  '-ac', '2',
-		  '-f', 'mp3',
-		  '-flush_packets', '1', // [新功能] 强制立即刷新每个数据包
-		  'pipe:1'
-		];
-        const ffmpeg = spawn('/usr/bin/ffmpeg', ffmpegArgs, { stdio: ['pipe', 'pipe', 'pipe'] });
-        
-        // 4. 从 Navidrome 获取原始流并喂给 FFmpeg
-        const upstreamUrl = navidromeClient.getStreamUrl(songId);
-        const u = new URL(upstreamUrl);
-        const httpMod = u.protocol === "https:" ? https : http;
-        const upstreamReq = httpMod.get(upstreamUrl, (upstreamRes) => {
-          if (upstreamRes.statusCode !== 200) {
-            logger.error(`[FFmpeg-Buffered] Upstream returned status ${upstreamRes.statusCode}`);
-            ffmpeg.kill();
-            if (!res.writableEnded) res.end();
-            return;
-          }
-          logger.info(`[FFmpeg-Buffered] Connected to upstream. Piping to FFmpeg stdin.`);
-          upstreamRes.pipe(ffmpeg.stdin);
-        });
-        upstreamReq.on('error', (err) => logger.error(`[FFmpeg-Buffered] Upstream request error: ${err.message}`));
+			const ffmpegArgs = [
+			  '-hide_banner', '-i', 'pipe:0', '-map', '0:a:0',
+			  '-c:a', 'libmp3lame', '-ar', '44100', '-b:a', '192k',
+			  '-ac', '2', '-f', 'mp3', '-flush_packets', '1',
+			  'pipe:1'
+			];
+			const ffmpeg = spawn('/usr/bin/ffmpeg', ffmpegArgs, { stdio: ['pipe', 'pipe', 'pipe'] });
+			
+			const upstreamUrl = navidromeClient.getStreamUrl(songId);
+			const u = new URL(upstreamUrl);
+			const httpMod = u.protocol === "https:" ? https : http;
+			const upstreamReq = httpMod.get(upstreamUrl, (upstreamRes) => {
+			  if (upstreamRes.statusCode !== 200) {
+				logger.error(`[FFmpeg-Buffered] Upstream returned status ${upstreamRes.statusCode}`);
+				if (!ffmpeg.killed) ffmpeg.kill();
+				if (!res.writableEnded) res.end();
+				return;
+			  }
+			  logger.info(`[FFmpeg-Buffered] Connected to upstream. Piping to FFmpeg stdin.`);
+			  upstreamRes.pipe(ffmpeg.stdin);
+			});
+			upstreamReq.on('error', (err) => logger.error(`[FFmpeg-Buffered] Upstream request error: ${err.message}`));
 
-        // 5. 将 FFmpeg 的输出（真实音频）发送给客户端
-        ffmpeg.stdout.on('data', (chunk) => {
-          if (!sentRealData) {
-            logger.info('[FFmpeg-Buffered] First chunk of real audio received. Stopping silent frames.');
-            sentRealData = true; // 标记已收到真实数据，停止发送静音帧
-          }
-          if (!res.writableEnded) {
-            res.write(chunk);
-          }
-        });
+			// 为 ffmpeg.stdout 和 res 添加错误处理，防止 EPIPE 崩溃
+			const cleanup = () => {
+				if (!ffmpeg.killed) {
+					ffmpeg.kill('SIGKILL');
+				}
+				if (upstreamReq) {
+					upstreamReq.destroy();
+				}
+			};
 
-        // 6. 清理和错误处理
-        ffmpeg.stderr.on('data', (data) => logger.debug(`[FFmpeg-Buffered stderr]: ${data.toString()}`));
-        ffmpeg.on('close', (code) => {
-          logger.info(`[FFmpeg-Buffered] Process exited with code ${code}.`);
-          if (!res.writableEnded) res.end();
-        });
-        ffmpeg.on('error', (err) => {
-          logger.error(`[FFmpeg-Buffered] Process error: ${err.message}`);
-          if (!res.writableEnded) res.end();
-        });
-        req.on('close', () => {
-          logger.warn('[FFmpeg-Buffered] Client connection closed, killing FFmpeg process.');
-          ffmpeg.kill('SIGKILL');
-          upstreamReq.destroy();
-        });
+			ffmpeg.stdout.on('error', (err) => {
+				if (err.code === 'EPIPE') {
+					logger.warn('[FFmpeg-Buffered] stdout pipe broken, client likely disconnected.');
+				} else {
+					logger.error(`[FFmpeg-Buffered] stdout error: ${err.message}`);
+				}
+				cleanup();
+			});
 
-      } catch (err) {
-        logger.error(`[Proxy] Error in /stream_proxy: ${err.stack || err.message}`);
-        if (!res.writableEnded) res.end();
-      }
-      return;
-    }
+			res.on('error', (err) => {
+				if (err.code === 'EPIPE') {
+					logger.warn('[FFmpeg-Buffered] Response stream pipe broken, client likely disconnected.');
+				} else {
+					logger.error(`[FFmpeg-Buffered] Response stream error: ${err.message}`);
+				}
+				cleanup();
+			});
+			
+			ffmpeg.stdout.on('data', (chunk) => {
+			  if (!sentRealData) {
+				logger.info('[FFmpeg-Buffered] First chunk of real audio received. Stopping silent frames.');
+				sentRealData = true;
+			  }
+			  if (!res.writableEnded) {
+				// 在写入前检查连接是否还存在
+				if (req.socket.destroyed) {
+					logger.warn('[FFmpeg-Buffered] Client socket destroyed, stopping stream.');
+					cleanup();
+					return;
+				}
+				res.write(chunk);
+			  }
+			});
+
+			ffmpeg.stderr.on('data', (data) => logger.debug(`[FFmpeg-Buffered stderr]: ${data.toString()}`));
+			ffmpeg.on('close', (code) => {
+			  logger.info(`[FFmpeg-Buffered] Process exited with code ${code}.`);
+			  if (!res.writableEnded) res.end();
+			});
+			ffmpeg.on('error', (err) => {
+			  logger.error(`[FFmpeg-Buffered] Process error: ${err.message}`);
+			  if (!res.writableEnded) res.end();
+			});
+			req.on('close', () => {
+			  logger.warn('[FFmpeg-Buffered] Client connection closed, initiating cleanup.');
+			  cleanup();
+			});
+
+		  } catch (err) {
+			logger.error(`[Proxy] Error in /stream_proxy: ${err.stack || err.message}`);
+			if (!res.writableEnded) res.end();
+		  }
+		  return;
+		}
 
     // lyric_proxy: 返回 LRC 格式歌词
     if (pathname === "/lyric_proxy") {
@@ -1340,8 +1364,25 @@ mcpServer.tool("now_playing", "获取当前播放队列", {}, async () => {
 
 // ---------------- main --------------------
 async function main() {
-  process.on('unhandledRejection', (r) => { logger.error('UnhandledRejection: ' + (r && (r.stack || r))); });
-  process.on('uncaughtException', (err) => { logger.error('UncaughtException: ' + (err && (err.stack || err.message))); process.exit(1); });
+  process.on('unhandledRejection', (reason, promise) => {
+    logger.error('----- UNHANDLED REJECTION -----');
+    logger.error('Unhandled Rejection at:', promise, 'reason:', reason instanceof Error ? reason.stack : reason);
+    logger.error('-------------------------------');
+  });
+  
+  process.on('uncaughtException', (err, origin) => {
+    if (err.code === 'EPIPE') {
+      logger.warn(`Caught a global EPIPE error, which is safe to ignore. Origin: ${origin}`);
+      return; 
+    }
+    
+    logger.error('----- UNCAUGHT EXCEPTION -----');
+    logger.error(`Caught exception: ${err}\n` + `Exception origin: ${origin}\n` + `Stack: ${err.stack}`);
+    logger.error('------------------------------');
+    logger.error('Fatal error detected. Exiting process.');
+    
+    process.exit(1);
+  });
 
   logger.info("Starting Navidrome MCP service...");
   const ok = await initializeNavidrome();

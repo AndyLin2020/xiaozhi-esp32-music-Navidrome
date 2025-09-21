@@ -79,6 +79,9 @@ public:
     virtual size_t GetBufferSize() const override { return buffer_size_; }
     virtual bool IsDownloading() const override { return is_downloading_; }
 
+	bool IsPlaying() const; 
+	void ForceStopAndClear();
+	
     // 播放列表接口
     bool Next();                       // 下一首
     bool Prev();                       // 上一首
@@ -122,6 +125,8 @@ private:
     // 播放/下载状态
     std::atomic<bool> is_playing_;
     std::atomic<bool> is_downloading_;
+	std::atomic<bool> force_stop_;
+	
     std::thread play_thread_;
     std::thread download_thread_;
     int64_t current_play_time_ms_;  // 当前播放时间（毫秒）

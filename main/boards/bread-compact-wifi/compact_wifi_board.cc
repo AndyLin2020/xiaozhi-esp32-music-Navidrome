@@ -9,6 +9,7 @@
 #include "lamp_controller.h"
 #include "led/single_led.h"
 #include "assets/lang_config.h"
+#include "esp32_music.h"
 
 #include <wifi_station.h>
 #include <esp_log.h>
@@ -21,6 +22,7 @@
 #endif
 
 #define TAG "CompactWifiBoard"
+#define SUPER_LONG_PRESS_MS 5000 // 5秒
 
 LV_FONT_DECLARE(font_puhui_14_1);
 LV_FONT_DECLARE(font_awesome_14_1);
@@ -146,9 +148,39 @@ private:
         });
 
         volume_down_button_.OnLongPress([this]() {
-            GetAudioCodec()->SetOutputVolume(0);
-            GetDisplay()->ShowNotification(Lang::Strings::MUTED);
-        });
+			ESP_LOGI(TAG, "音量减键长按触发 (>=1.5s)，开始超长按计时...");
+			
+			// 记录长按开始的时间点
+			int64_t long_press_start_time = esp_timer_get_time();
+			bool super_long_press_action_done = false; 
+
+			// 进入一个循环，直到按键被释放
+			while(gpio_get_level(VOLUME_DOWN_BUTTON_GPIO) == 0) {
+				int64_t duration_ms = (esp_timer_get_time() - long_press_start_time) / 1000;
+
+				// 检查是否达到了超长按的阈值
+				if (duration_ms >= (SUPER_LONG_PRESS_MS - 1500) && !super_long_press_action_done) {
+					 super_long_press_action_done = true;
+					 ESP_LOGI(TAG, "超长按条件满足 (>=5s)，执行强制停止操作！");
+
+					 auto& music_player = Esp32Music::GetInstance();
+					 
+					 music_player.ForceStopAndClear();
+					 GetDisplay()->ShowNotification("播放已停止");
+					 
+					 break; 
+				}
+				vTaskDelay(pdMS_TO_TICKS(100));
+			}
+
+			// 如果循环结束时，超长按的动作没有被执行，
+			// 那么这就是一次普通的“长按”，执行静音操作。
+			if (!super_long_press_action_done) {
+				ESP_LOGI(TAG, "按键已释放，判定为普通长按 -> 静音");
+				GetAudioCodec()->SetOutputVolume(0);
+				GetDisplay()->ShowNotification(Lang::Strings::MUTED);
+			}
+		});
     }
 
     // 物联网初始化，逐步迁移到 MCP 协议
