@@ -122,7 +122,6 @@ void WifiStation::Start() {
     };
     ESP_ERROR_CHECK(esp_timer_create(&timer_args, &timer_handle_));
 
-    // 将 esp_wifi_start() 放回函数末尾，以保持与上层代码的同步逻辑兼容
     ESP_ERROR_CHECK(esp_wifi_start());
 }
 
@@ -131,180 +130,123 @@ bool WifiStation::WaitForConnected(int timeout_ms) {
 }
 
 void WifiStation::HandleScanResult() {
-    // 静态变量：记录上次是否是定向扫描 & 已经尝试过的目标 SSID 列表
+    static std::vector<CandidateAp> candidates;
     static bool last_scan_was_targeted = false;
-    static std::vector<std::string> tried_targeted;
+    static std::string last_targeted_ssid; 
 
     uint16_t ap_num = 0;
-    esp_err_t rc = esp_wifi_scan_get_ap_num(&ap_num);
-    if (rc != ESP_OK) {
-        ESP_LOGW(TAG, "esp_wifi_scan_get_ap_num failed: %s", esp_err_to_name(rc));
-        if (timer_handle_) esp_timer_start_once(timer_handle_, 5000 * 1000);
-        // 不改 last_scan_was_targeted
-        return;
-    }
+    esp_wifi_scan_get_ap_num(&ap_num);
 
-    std::vector<wifi_ap_record_t> scanned_aps;
+    std::vector<wifi_ap_record_t> scanned_aps(ap_num);
     if (ap_num > 0) {
-        scanned_aps.resize(ap_num);
-        if (esp_wifi_scan_get_ap_records(&ap_num, scanned_aps.data()) != ESP_OK) {
-            ESP_LOGW(TAG, "esp_wifi_scan_get_ap_records failed");
-            scanned_aps.clear();
+        esp_wifi_scan_get_ap_records(&ap_num, scanned_aps.data());
+    }
+
+    ESP_LOGI(TAG, "HandleScanResult: scanned %u AP records (targeted_scan=%d)", ap_num, last_scan_was_targeted ? 1 : 0);
+
+    // 如果是新的全信道扫描，清空并重建候选列表
+    if (!last_scan_was_targeted) {
+        candidates.clear();
+        auto saved_list = SsidManager::GetInstance().GetSsidList();
+        if (saved_list.empty()) {
+            ESP_LOGW(TAG, "No saved SSIDs.");
+            if (timer_handle_) esp_timer_start_once(timer_handle_, 10000 * 1000);
+            return;
         }
-    }
-
-    ESP_LOGI(TAG, "HandleScanResult: scanned %d AP records (last_scan_was_targeted=%d)",
-             (int)scanned_aps.size(), last_scan_was_targeted ? 1 : 0);
-
-    // 如果这是一轮由“定时器/启动”触发的 full-scan（非定向）并且返回了结果，
-    // 我们可以清空 tried_targeted，让下一轮重新尝试未命中的隐藏 SSID。
-    if (!last_scan_was_targeted && !scanned_aps.empty()) {
-        tried_targeted.clear();
-    }
-
-    // -------- 获取已保存的 SSID 列表 --------
-    auto& ssid_manager = SsidManager::GetInstance();
-    auto saved_list = ssid_manager.GetSsidList();
-    if (saved_list.empty()) {
-        ESP_LOGW(TAG, "No saved SSIDs.");
-        if (timer_handle_) esp_timer_start_once(timer_handle_, 10000 * 1000);
-        last_scan_was_targeted = false;
-        return;
-    }
-
-    // 打印扫描到的 AP（便于诊断：能看出 ZG 是否出现及其 RSSI）
-    for (const auto &ap : scanned_aps) {
-        size_t ssid_len = strnlen(reinterpret_cast<const char*>(ap.ssid), sizeof(ap.ssid));
-        std::string ap_ssid(reinterpret_cast<const char*>(ap.ssid), ssid_len);
-        char mac[18];
-        snprintf(mac, sizeof(mac), "%02x:%02x:%02x:%02x:%02x:%02x",
-                 ap.bssid[0], ap.bssid[1], ap.bssid[2], ap.bssid[3], ap.bssid[4], ap.bssid[5]);
-        ESP_LOGD(TAG, " Scanned AP: SSID='%s' len=%d BSSID=%s chan=%d rssi=%d",
-                 ap_ssid.c_str(), (int)ssid_len, mac, ap.primary, ap.rssi);
-    }
-
-    // -------- 建立候选列表（优先把所有保存的 SSID 都作为候选） --------
-    const int8_t RSSI_FOR_UNSCANNED = -100;
-    struct Candidate { WifiApRecord r; int8_t rssi; };
-    std::vector<Candidate> candidates;
-    candidates.reserve(saved_list.size());
-    for (const auto &si : saved_list) {
-        Candidate c;
-        c.r.ssid = si.ssid;
-        c.r.password = si.password;
-        c.rssi = RSSI_FOR_UNSCANNED;
-        c.r.channel = 0;
-        c.r.authmode = WIFI_AUTH_WPA2_PSK;
-        memset(c.r.bssid, 0, sizeof(c.r.bssid));
-        candidates.push_back(std::move(c));
-    }
-
-    // 用扫描结果更新 candidates（同名 SSID 取最高 RSSI）
-    for (const auto &ap : scanned_aps) {
-        size_t ssid_len = strnlen(reinterpret_cast<const char*>(ap.ssid), sizeof(ap.ssid));
-        std::string ap_ssid(reinterpret_cast<const char*>(ap.ssid), ssid_len);
-        if (ap_ssid.empty()) {
-            // 隐藏 SSID（空名字）——打印 BSSID/RSSI 供排查
-            char mac[18];
-            snprintf(mac, sizeof(mac), "%02x:%02x:%02x:%02x:%02x:%02x",
-                     ap.bssid[0], ap.bssid[1], ap.bssid[2], ap.bssid[3], ap.bssid[4], ap.bssid[5]);
-            ESP_LOGD(TAG, "Scanned hidden AP BSSID=%s rssi=%d chan=%d", mac, ap.rssi, ap.primary);
-            continue;
+        for (const SsidItem &si : saved_list) {
+            CandidateAp cand;
+            cand.record.ssid = si.ssid;
+            cand.record.password = si.password;
+            cand.rssi = RSSI_FOR_UNSCANNED_AP;
+            memset(cand.record.bssid, 0, sizeof(cand.record.bssid));
+            cand.record.channel = 0;
+            cand.record.authmode = WIFI_AUTH_WPA2_PSK;
+            candidates.push_back(cand);
         }
-        for (auto &cand : candidates) {
-            if (cand.r.ssid == ap_ssid) {
-                if (ap.rssi > cand.rssi) {
+
+        // 用全信道扫描结果填充RSSI值（对能直接匹配 SSID 的 AP 更新真实 RSSI）
+        for (const auto &ap : scanned_aps) {
+            std::string ap_ssid(reinterpret_cast<const char*>(ap.ssid));
+            for (auto &cand : candidates) {
+                if (cand.record.ssid == ap_ssid) {
                     cand.rssi = ap.rssi;
-                    cand.r.channel = ap.primary;
-                    cand.r.authmode = ap.authmode;
-                    memcpy(cand.r.bssid, ap.bssid, sizeof(ap.bssid));
+                    memcpy(cand.record.bssid, ap.bssid, 6);
+                    cand.record.channel = ap.primary;
+                    cand.record.authmode = ap.authmode;
+                }
+            }
+        }
+    } else { 
+        for (const auto &ap : scanned_aps) {
+            std::string ap_ssid(reinterpret_cast<const char*>(ap.ssid));
+            for (auto &cand : candidates) {
+                bool match = false;
+                if (!ap_ssid.empty()) {
+                    if (cand.record.ssid == ap_ssid) match = true;
+                } else {
+                    if (!last_targeted_ssid.empty() && cand.record.ssid == last_targeted_ssid) match = true;
+                }
+
+                if (match) {
+                    cand.rssi = ap.rssi;
+                    ESP_LOGI(TAG, "Targeted scan: Hidden/targeted SSID '%s' found. RSSI=%d.",
+                             cand.record.ssid.c_str(), cand.rssi);
+
+                    memcpy(cand.record.bssid, ap.bssid, 6);
+                    cand.record.channel = ap.primary;
+                    cand.record.authmode = ap.authmode;
                 }
             }
         }
     }
 
-    // 找到本次扫描中被识别出来的最强 RSSI（如果有）
-    int8_t best_scanned_rssi = -127;
-    for (const auto &c : candidates) {
-        if (c.rssi != RSSI_FOR_UNSCANNED && c.rssi > best_scanned_rssi) {
-            best_scanned_rssi = c.rssi;
-        }
-    }
-
-    // 决定是否需要对未扫描到的保存 SSID 做定向扫描（更强的隐藏 AP）
-    const int8_t FAST_CONNECT_THRESHOLD = -80; // 改为 -80，减少过度触发
-    bool needs_targeted = false;
-    if (best_scanned_rssi == -127) {
-        // 未扫描到任何保存的 SSID
-        needs_targeted = true;
-    } else if (best_scanned_rssi < FAST_CONNECT_THRESHOLD) {
-        // 扫描到的最强信号仍然较弱 -> 可能存在强的隐藏 SSID
-        needs_targeted = true;
-    }
-
-    if (needs_targeted && !connecting_.load() && !IsConnected()) {
-        // 收集未被扫描到的 SSID
-        std::vector<std::string> unscanned;
-        for (const auto &c : candidates) {
-            if (c.rssi == RSSI_FOR_UNSCANNED) unscanned.push_back(c.r.ssid);
+    if (!last_scan_was_targeted) {
+        std::string target_ssid;
+        for (const auto& cand : candidates) {
+            if (cand.rssi == RSSI_FOR_UNSCANNED_AP) {
+                target_ssid = cand.record.ssid;
+                break;
+            }
         }
 
-        // 找第一个还没尝试过的
-        std::string to_target;
-        for (const auto &s : unscanned) {
-            bool tried = false;
-            for (const auto &t : tried_targeted) if (t == s) { tried = true; break; }
-            if (!tried) { to_target = s; break; }
-        }
-
-        if (!to_target.empty()) {
-            // 发起定向扫描（对单个 SSID 做 active probe across channels）
-            tried_targeted.push_back(to_target);
-            ESP_LOGI(TAG, "HandleScanResult: performing QUICK targeted scan for hidden SSID '%s'", to_target.c_str());
-
-            // 标记本次扫描是定向扫描
+        if (!target_ssid.empty() && !connecting_.load() && !IsConnected()) {
+            ESP_LOGI(TAG, "Performing targeted scan for hidden SSID '%s'", target_ssid.c_str());
             last_scan_was_targeted = true;
+            last_targeted_ssid = target_ssid; 
 
             wifi_scan_config_t scan_cfg = {};
-            // 将 const char* 转成 SDK 需要的 uint8_t*（SDK 不会修改字符串）
-            scan_cfg.ssid = const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(to_target.c_str()));
+            scan_cfg.ssid = reinterpret_cast<uint8_t*>(const_cast<char*>(target_ssid.c_str()));
             scan_cfg.show_hidden = true;
             scan_cfg.scan_type = WIFI_SCAN_TYPE_ACTIVE;
-            // 增加时间提升命中率（针对隐藏 SSID）
-            scan_cfg.scan_time.active.min = 300; // ms per channel
+            scan_cfg.scan_time.active.min = 300;
             scan_cfg.scan_time.active.max = 600;
-            esp_err_t r = esp_wifi_scan_start(&scan_cfg, false);
-            if (r != ESP_OK) {
-                ESP_LOGW(TAG, "targeted esp_wifi_scan_start failed for '%s': %s", to_target.c_str(), esp_err_to_name(r));
-                if (timer_handle_) esp_timer_start_once(timer_handle_, 3000 * 1000);
-                // 清除定向标记（下次 full-scan 时才真正清空 tried_targeted）
+
+            if (esp_wifi_scan_start(&scan_cfg, false) != ESP_OK) {
                 last_scan_was_targeted = false;
+                last_targeted_ssid.clear();
+                if (timer_handle_) esp_timer_start_once(timer_handle_, 5000 * 1000);
             }
-            return; // 等待定向扫描结果
+            return;
         }
-        // 如果所有 unscanned 都尝试过了，我们就按已有信息去排序连接
     }
 
-    // 排序候选列表（RSSI 高者优先）
-    std::sort(candidates.begin(), candidates.end(), [](const Candidate &a, const Candidate &b){
+    last_scan_was_targeted = false;
+    last_targeted_ssid.clear();
+
+    std::sort(candidates.begin(), candidates.end(), [](const CandidateAp &a, const CandidateAp &b) {
         return a.rssi > b.rssi;
     });
 
-    // 填充 connect_queue_
     connect_queue_.clear();
     ESP_LOGI(TAG, "--- Connection Candidates (best signal first) ---");
     for (const auto &cand : candidates) {
         ESP_LOGI(TAG, "  - SSID: %-20s RSSI: %4d %s",
-                 cand.r.ssid.c_str(), cand.rssi,
-                 (cand.rssi == RSSI_FOR_UNSCANNED ? "(Unscanned/Hidden)" : ""));
-        connect_queue_.push_back(cand.r);
+                 cand.record.ssid.c_str(), cand.rssi,
+                 (cand.rssi == RSSI_FOR_UNSCANNED_AP ? "(Unscanned/Hidden & Not Found)" : ""));
+        connect_queue_.push_back(cand.record);
     }
     ESP_LOGI(TAG, "-------------------------------------------------");
 
-    // 清除定向标记（既然我们已处理这次扫描）
-    last_scan_was_targeted = false;
-
-    // 如果尚未连接并且没有正在连接，立即尝试最优者
     if (!connect_queue_.empty() && !connecting_.load() && !IsConnected()) {
         StartConnect();
     } else if (connect_queue_.empty()) {
@@ -348,7 +290,7 @@ void WifiStation::StartConnect() {
     ESP_LOGI(TAG, "Attempting to connect to SSID: '%s'", ssid_.c_str());
     if (esp_wifi_connect() != ESP_OK) {
         connecting_.store(false);
-        if (!connect_queue_.empty()) StartConnect(); // 立即尝试下一个
+        if (!connect_queue_.empty()) StartConnect(); 
     }
 }
 
@@ -386,11 +328,9 @@ void WifiStation::WifiEventHandler(void* arg, esp_event_base_t event_base, int32
                 }
             }
 
-            // 使用 timer 延迟一个短时（500ms）去触发首次扫描，以稳定RF
             if (self->timer_handle_) {
                 esp_timer_start_once(self->timer_handle_, 500 * 1000);
             } else {
-                // 兜底：直接触发一次快速主动扫描
                 wifi_scan_config_t scan_cfg = {};
                 scan_cfg.show_hidden = true;
                 scan_cfg.scan_type = WIFI_SCAN_TYPE_ACTIVE;
@@ -405,10 +345,7 @@ void WifiStation::WifiEventHandler(void* arg, esp_event_base_t event_base, int32
 
         case WIFI_EVENT_SCAN_DONE: {
             ESP_LOGI(TAG, "WIFI_EVENT_SCAN_DONE.");
-            // 当已连接时通常不处理全量扫描结果以避免打断；但如果是 targeted scan 的结果（该函数通过 tried_targeted 管理），
-            // 也允许 HandleScanResult 去查看更新（HandleScanResult 内有保护）。
             if (!self->IsConnected()) {
-                // 直接处理扫描结果（内部会决定是否需要 targeted 并发/返回）
                 self->HandleScanResult();
             } else {
                 ESP_LOGI(TAG, "Scan done while connected — ignoring to avoid disrupting connection.");
@@ -418,7 +355,6 @@ void WifiStation::WifiEventHandler(void* arg, esp_event_base_t event_base, int32
 
         case WIFI_EVENT_STA_CONNECTED: {
             ESP_LOGI(TAG, "WIFI_EVENT_STA_CONNECTED (link established).");
-            // 保持 connecting_ true 直到 IpEventHandler 获得 IP 并清理
             break;
         }
 
@@ -427,22 +363,19 @@ void WifiStation::WifiEventHandler(void* arg, esp_event_base_t event_base, int32
             int reason = dis ? dis->reason : -1;
             ESP_LOGW(TAG, "WIFI_EVENT_STA_DISCONNECTED, reason=%d", reason);
 
-            // 清除连接事件位（你的 WaitForConnected/IsConnected 使用该位）
             xEventGroupClearBits(self->event_group_, WIFI_EVENT_CONNECTED);
             self->connecting_.store(false);
 
-            // 尝试少次数的驱动层 reconnect 优先（短等待）
             if (self->reconnect_count_ < MAX_RECONNECT_COUNT) {
                 self->reconnect_count_++;
                 ESP_LOGI(TAG, "Driver reconnect attempt %d/%d to '%s'", self->reconnect_count_, MAX_RECONNECT_COUNT, self->ssid_.c_str());
-                // 小延时以稍微缓冲
+
                 vTaskDelay(pdMS_TO_TICKS(500 * self->reconnect_count_));
                 self->connecting_.store(true);
                 if (esp_wifi_connect() != ESP_OK) {
                     self->connecting_.store(false);
                 }
             } else {
-                // 放弃当前 SSID 的自动驱动重连，尝试队列里的下一个候选或重新扫描
                 ESP_LOGW(TAG, "Giving up reconnects to '%s' after %d tries.", self->ssid_.c_str(), self->reconnect_count_);
                 if (!self->connect_queue_.empty()) {
                     ESP_LOGI(TAG, "Trying next candidate in queue.");
